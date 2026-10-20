@@ -1,0 +1,7 @@
+<Solution>
+  <Configurations>
+    <Platform Name="x64" />
+    <Platform Name="x86" />
+  </Configurations>
+  <Project Path="Aksys Win11 Shim S56 Z48 MPC4000/Aksys Win11 Shim S56 Z48 MPC4000.vcxproj" />
+</Solution>
