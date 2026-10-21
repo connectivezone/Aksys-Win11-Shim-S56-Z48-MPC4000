@@ -3,7 +3,7 @@ setlocal
 cd /d "%~dp0"
 echo ============================================================================
 echo  Akai S5000 / S6000 / Z4 / Z8 / MPC4000 WinUSB + UI Scaler Builder
-echo  Version: v15.5 Universal (Direct Shell Drop Bridge + Multi-Sampler Support)
+echo  Version: v15.6 Universal (Direct Shell Drop Bridge + Multi-Sampler Support)
 echo ============================================================================
 echo.
 
@@ -68,7 +68,7 @@ if %ERRORLEVEL% neq 0 (
     exit /b 1
 )
 
-echo [*] Compiling 32-bit version.dll proxy (v15.5 Universal S56/Z48/MPC4000 Release)...
+echo [*] Compiling 32-bit version.dll proxy (v15.6 Universal S56/Z48/MPC4000 Release)...
 cl.exe /nologo /O2 /LD /EHsc "%CPP_FILE%" /link /OUT:version.dll /MACHINE:X86 setupapi.lib winusb.lib user32.lib gdi32.lib advapi32.lib ole32.lib shell32.lib shlwapi.lib oleaut32.lib
 if %ERRORLEVEL% neq 0 (
     echo.
@@ -78,7 +78,7 @@ if %ERRORLEVEL% neq 0 (
 )
 
 echo.
-echo [+] SUCCESS! Built 32-bit version.dll (v15.5 Universal).
+echo [+] SUCCESS! Built 32-bit version.dll (v15.6 Universal).
 echo.
 
 set "DEV_DIR=C:\Program Files (x86)\AKAIPRO\aksys\devices"
@@ -107,6 +107,6 @@ icacls "%ROOT_DIR%" /grant *S-1-5-32-545:(OI)(CI)M /T >nul 2>nul
 :instructions
 echo.
 echo ============================================================================
-echo  v15.5 UNIVERSAL PRODUCTION RELEASE READY (DIRECT SHELL DROP BRIDGE)
+echo  v15.6 UNIVERSAL PRODUCTION RELEASE READY (FULL MEMORY EXPORT SUPPORT)
 echo ============================================================================
 pause

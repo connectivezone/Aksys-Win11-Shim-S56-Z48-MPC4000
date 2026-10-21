@@ -1,6 +1,6 @@
 // ============================================================================
 // Akai S5000 / S6000 / Z4 / Z8 / MPC4000 Windows 11 64-Bit WinUSB Shim & Scaler
-// Version: v15.5 Production Release (Direct Shell Drop Target Bridge)
+// Version: v15.7 Production Release (Clean Memory Folder Export - UploadCache Stripped)
 // File: akS56USB_WinUSB_Shim.cpp -> Compiles to version.dll (x86)
 // ============================================================================
 
@@ -50,10 +50,199 @@ static DWORD g_MainProcessId = 0;
 static DWORD g_MainThreadId = 0;
 static HMODULE g_hShimModule = NULL;
 
+// ----------------------------------------------------------------------------
+// Multi-File Drag-and-Drop & Memory Bank Directory Mirroring Engine
+// ----------------------------------------------------------------------------
 static bool g_InDragSession = false;
+static bool g_DragTargetFolderActive = false;
 static char g_DragTargetFolder[MAX_PATH] = {0};
-static char g_LastWrittenFilePath[MAX_PATH] = {0};
-static char g_LastWrittenFileName[MAX_PATH] = {0};
+static DWORD g_LastTransferTick = 0;
+
+#define MAX_STAGED_FILES 128
+struct StagedFileTracker {
+    HANDLE hFile;
+    char srcPath[MAX_PATH];
+    char destPath[MAX_PATH];
+    bool active;
+};
+
+#define MAX_PENDING_DROPS 128
+struct PendingDropItem {
+    char srcPath[MAX_PATH];
+    char relPath[MAX_PATH];
+};
+
+static CRITICAL_SECTION g_StagedLock;
+static StagedFileTracker g_StagedFiles[MAX_STAGED_FILES];
+static PendingDropItem g_PendingDrops[MAX_PENDING_DROPS];
+static int g_PendingDropCount = 0;
+
+static bool CreateDirectoryRecursiveA(const char* path) {
+    if (!path || !path[0]) return false;
+    char temp[MAX_PATH];
+    strncpy(temp, path, MAX_PATH - 1);
+    temp[MAX_PATH - 1] = '\0';
+
+    size_t len = strlen(temp);
+    if (len > 0 && (temp[len - 1] == '\\' || temp[len - 1] == '/')) {
+        temp[len - 1] = '\0';
+    }
+
+    DWORD attr = GetFileAttributesA(temp);
+    if (attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY)) {
+        return true;
+    }
+
+    char* p = strrchr(temp, '\\');
+    char* p2 = strrchr(temp, '/');
+    if (p2 > p) p = p2;
+    if (p && p != temp) {
+        *p = '\0';
+        if (strlen(temp) > 2 || (strlen(temp) == 2 && temp[1] != ':')) {
+            CreateDirectoryRecursiveA(temp);
+        }
+        *p = '\\';
+    }
+
+    return (CreateDirectoryA(temp, NULL) || GetLastError() == ERROR_ALREADY_EXISTS);
+}
+
+static void CreateParentDirectoryA(const char* filePath) {
+    if (!filePath || !filePath[0]) return;
+    char dir[MAX_PATH];
+    strncpy(dir, filePath, MAX_PATH - 1);
+    dir[MAX_PATH - 1] = '\0';
+    char* lastSlash = strrchr(dir, '\\');
+    char* lastSlash2 = strrchr(dir, '/');
+    if (lastSlash2 > lastSlash) lastSlash = lastSlash2;
+    if (lastSlash && lastSlash != dir) {
+        *lastSlash = '\0';
+        CreateDirectoryRecursiveA(dir);
+    }
+}
+
+static bool StripStagingCachePrefix(char* path) {
+    if (!path || !path[0]) return false;
+
+    while (path[0] == '\\' || path[0] == '/') {
+        memmove(path, path + 1, strlen(path));
+    }
+
+    char lower[MAX_PATH] = {0};
+    strncpy(lower, path, MAX_PATH - 1);
+    _strlwr(lower);
+
+    const char* prefixes[] = {
+        "uploadcache",
+        "upload_cache",
+        "upload cache",
+        "aksys_transfer_cache",
+        "transfer_cache",
+        "transfercache"
+    };
+
+    bool stripped = false;
+    for (int i = 0; i < (int)(sizeof(prefixes) / sizeof(prefixes[0])); i++) {
+        size_t pLen = strlen(prefixes[i]);
+        if (strncmp(lower, prefixes[i], pLen) == 0) {
+            char nextChar = path[pLen];
+            if (nextChar == '\\' || nextChar == '/') {
+                size_t skip = pLen + 1;
+                while (path[skip] == '\\' || path[skip] == '/') skip++;
+                memmove(path, path + skip, strlen(path + skip) + 1);
+                stripped = true;
+                strncpy(lower, path, MAX_PATH - 1);
+                _strlwr(lower);
+                i = -1;
+            } else if (nextChar == '\0') {
+                path[0] = '\0';
+                return true;
+            }
+        }
+    }
+    return stripped;
+}
+
+static bool GetRelativePathFromAksysOrName(LPCSTR name, char* outRelPath, DWORD maxLen) {
+    if (!name || !outRelPath || maxLen == 0) return false;
+    outRelPath[0] = 0;
+
+    char lower[MAX_PATH] = {0};
+    strncpy(lower, name, MAX_PATH - 1);
+    _strlwr(lower);
+
+    // 1. Detect ak.Sys internal UploadCache staging path
+    const char* pUpload = strstr(lower, "uploadcache");
+    if (!pUpload) pUpload = strstr(lower, "upload_cache");
+    if (!pUpload) pUpload = strstr(lower, "upload cache");
+    if (pUpload) {
+        const char* pOrig = name + (pUpload - lower);
+        const char* pSlash = strchr(pOrig, '\\');
+        if (!pSlash) pSlash = strchr(pOrig, '/');
+        if (pSlash && pSlash[1]) {
+            strncpy(outRelPath, pSlash + 1, maxLen - 1);
+            outRelPath[maxLen - 1] = '\0';
+            StripStagingCachePrefix(outRelPath);
+            return true;
+        } else {
+            outRelPath[0] = '\0';
+            return true;
+        }
+    }
+
+    // 2. Check for AKSys_Transfer_Cache
+    const char* pTrans = strstr(lower, "aksys_transfer_cache");
+    if (pTrans) {
+        const char* pOrig = name + (pTrans - lower);
+        const char* pSlash = strchr(pOrig, '\\');
+        if (!pSlash) pSlash = strchr(pOrig, '/');
+        if (pSlash && pSlash[1]) {
+            strncpy(outRelPath, pSlash + 1, maxLen - 1);
+            outRelPath[maxLen - 1] = '\0';
+            StripStagingCachePrefix(outRelPath);
+            return true;
+        } else {
+            outRelPath[0] = '\0';
+            return true;
+        }
+    }
+
+    // 3. Check for standard aksys installation root
+    const char* pAksys = strstr(lower, "aksys");
+    if (pAksys) {
+        const char* pOrig = name + (pAksys - lower);
+        const char* pSlash = strchr(pOrig, '\\');
+        if (!pSlash) pSlash = strchr(pOrig, '/');
+        if (pSlash && pSlash[1]) {
+            strncpy(outRelPath, pSlash + 1, maxLen - 1);
+            outRelPath[maxLen - 1] = '\0';
+            StripStagingCachePrefix(outRelPath);
+            return true;
+        }
+    }
+
+    // 4. Relative or bare file name
+    if (strstr(lower, ":\\") == NULL && strstr(lower, ":/") == NULL) {
+        strncpy(outRelPath, name, maxLen - 1);
+        outRelPath[maxLen - 1] = '\0';
+        StripStagingCachePrefix(outRelPath);
+        return true;
+    }
+
+    const char* lastSlash = strrchr(name, '\\');
+    if (!lastSlash) lastSlash = strrchr(name, '/');
+    if (lastSlash && lastSlash[1]) {
+        strncpy(outRelPath, lastSlash + 1, maxLen - 1);
+        outRelPath[maxLen - 1] = '\0';
+        StripStagingCachePrefix(outRelPath);
+        return true;
+    }
+
+    strncpy(outRelPath, name, maxLen - 1);
+    outRelPath[maxLen - 1] = '\0';
+    StripStagingCachePrefix(outRelPath);
+    return true;
+}
 
 static bool GetExplorerFolderPath(HWND hwndTarget, char* outPath, DWORD maxLen) {
     if (!hwndTarget || !outPath || maxLen == 0) return false;
@@ -113,31 +302,34 @@ static bool GetExplorerFolderPath(HWND hwndTarget, char* outPath, DWORD maxLen) 
     return false;
 }
 
-static void RecordStagedFileAndDeliver(const char* fullPath) {
-    if (!fullPath || !fullPath[0]) return;
-    strncpy(g_LastWrittenFilePath, fullPath, MAX_PATH - 1);
-    const char* lastSlash = strrchr(fullPath, '\\');
-    if (!lastSlash) lastSlash = strrchr(fullPath, '/');
-    const char* baseName = lastSlash ? (lastSlash + 1) : fullPath;
-    strncpy(g_LastWrittenFileName, baseName, MAX_PATH - 1);
-
-    if (g_InDragSession && g_DragTargetFolder[0]) {
-        char destPath[MAX_PATH] = {0};
-        snprintf(destPath, sizeof(destPath), "%s\\%s", g_DragTargetFolder, g_LastWrittenFileName);
-        CopyFileA(g_LastWrittenFilePath, destPath, FALSE);
-        SHChangeNotify(SHCNE_CREATE, SHCNF_PATHA, destPath, NULL);
+static void DeliverFileToTarget(const char* srcPath, const char* destPath) {
+    if (!srcPath || !srcPath[0] || !destPath || !destPath[0]) return;
+    CreateParentDirectoryA(destPath);
+    CopyFileA(srcPath, destPath, FALSE);
+    SHChangeNotify(SHCNE_CREATE, SHCNF_PATHA, destPath, NULL);
+    if (g_DragTargetFolder[0]) {
         SHChangeNotify(SHCNE_UPDATEDIR, SHCNF_PATHA, g_DragTargetFolder, NULL);
     }
+}
+
+static void FlushPendingDropsToTarget() {
+    if (!g_DragTargetFolder[0] || g_PendingDropCount <= 0) return;
+    for (int i = 0; i < g_PendingDropCount; i++) {
+        char finalDest[MAX_PATH] = {0};
+        snprintf(finalDest, sizeof(finalDest), "%s\\%s", g_DragTargetFolder, g_PendingDrops[i].relPath);
+        DeliverFileToTarget(g_PendingDrops[i].srcPath, finalDest);
+    }
+    g_PendingDropCount = 0;
 }
 
 typedef HRESULT (WINAPI *PFN_DoDragDrop)(LPDATAOBJECT, LPDROPSOURCE, DWORD, LPDWORD);
 static PFN_DoDragDrop g_realDoDragDrop = NULL;
 
 static HRESULT WINAPI Hook_DoDragDrop(LPDATAOBJECT pDataObj, LPDROPSOURCE pDropSource, DWORD dwOKEffects, LPDWORD pdwEffect) {
+    EnterCriticalSection(&g_StagedLock);
     g_InDragSession = true;
-    g_DragTargetFolder[0] = 0;
-    g_LastWrittenFilePath[0] = 0;
-    g_LastWrittenFileName[0] = 0;
+    g_PendingDropCount = 0;
+    LeaveCriticalSection(&g_StagedLock);
 
     HRESULT hr = S_OK;
     if (g_realDoDragDrop) {
@@ -150,20 +342,81 @@ static HRESULT WINAPI Hook_DoDragDrop(LPDATAOBJECT pDataObj, LPDROPSOURCE pDropS
         POINT pt;
         GetCursorPos(&pt);
         HWND hwndDrop = WindowFromPoint(pt);
-        if (GetExplorerFolderPath(hwndDrop, g_DragTargetFolder, sizeof(g_DragTargetFolder))) {
-            if (g_LastWrittenFilePath[0] && g_LastWrittenFileName[0]) {
-                char destPath[MAX_PATH] = {0};
-                snprintf(destPath, sizeof(destPath), "%s\\%s", g_DragTargetFolder, g_LastWrittenFileName);
-                CopyFileA(g_LastWrittenFilePath, destPath, FALSE);
-                SHChangeNotify(SHCNE_CREATE, SHCNF_PATHA, destPath, NULL);
-                SHChangeNotify(SHCNE_UPDATEDIR, SHCNF_PATHA, g_DragTargetFolder, NULL);
-            }
+        char targetDir[MAX_PATH] = {0};
+        if (GetExplorerFolderPath(hwndDrop, targetDir, sizeof(targetDir)) && targetDir[0]) {
+            EnterCriticalSection(&g_StagedLock);
+            strncpy(g_DragTargetFolder, targetDir, MAX_PATH - 1);
+            g_DragTargetFolder[MAX_PATH - 1] = '\0';
+            g_DragTargetFolderActive = true;
+            g_LastTransferTick = GetTickCount();
+
+            FlushPendingDropsToTarget();
+            LeaveCriticalSection(&g_StagedLock);
+
+            SHChangeNotify(SHCNE_UPDATEDIR, SHCNF_PATHA, g_DragTargetFolder, NULL);
         }
     }
 
-    Sleep(150);
+    EnterCriticalSection(&g_StagedLock);
     g_InDragSession = false;
+    LeaveCriticalSection(&g_StagedLock);
     return hr;
+}
+
+static BOOL WINAPI Hook_CreateDirectoryA(LPCSTR lpPathName, LPSECURITY_ATTRIBUTES lpSecurityAttributes) {
+    if (!lpPathName || !lpPathName[0]) return FALSE;
+
+    BOOL ok = CreateDirectoryRecursiveA(lpPathName);
+
+    char relPath[MAX_PATH] = {0};
+    if (GetRelativePathFromAksysOrName(lpPathName, relPath, sizeof(relPath)) && relPath[0]) {
+        char tempPath[MAX_PATH] = {0};
+        if (GetTempPathA(MAX_PATH, tempPath)) {
+            char stageSubDir[MAX_PATH] = {0};
+            snprintf(stageSubDir, sizeof(stageSubDir), "%sAKSys_Transfer_Cache\\%s", tempPath, relPath);
+            CreateDirectoryRecursiveA(stageSubDir);
+        }
+
+        EnterCriticalSection(&g_StagedLock);
+        if (g_DragTargetFolderActive && g_DragTargetFolder[0]) {
+            char destDir[MAX_PATH] = {0};
+            snprintf(destDir, sizeof(destDir), "%s\\%s", g_DragTargetFolder, relPath);
+            CreateDirectoryRecursiveA(destDir);
+            SHChangeNotify(SHCNE_MKDIR, SHCNF_PATHA, destDir, NULL);
+            SHChangeNotify(SHCNE_UPDATEDIR, SHCNF_PATHA, g_DragTargetFolder, NULL);
+            g_LastTransferTick = GetTickCount();
+        }
+        LeaveCriticalSection(&g_StagedLock);
+    }
+
+    return ok;
+}
+
+static BOOL WINAPI Hook_CreateDirectoryW(LPCWSTR lpPathName, LPSECURITY_ATTRIBUTES lpSecurityAttributes) {
+    if (!lpPathName || !lpPathName[0]) return FALSE;
+    char ansiPath[MAX_PATH] = {0};
+    WideCharToMultiByte(CP_ACP, 0, lpPathName, -1, ansiPath, MAX_PATH - 1, NULL, NULL);
+    return Hook_CreateDirectoryA(ansiPath, lpSecurityAttributes);
+}
+
+static void RegisterStagedHandle(HANDLE hFile, const char* srcPath, const char* relPath) {
+    if (!hFile || hFile == INVALID_HANDLE_VALUE || !srcPath || !relPath) return;
+    EnterCriticalSection(&g_StagedLock);
+    for (int i = 0; i < MAX_STAGED_FILES; i++) {
+        if (!g_StagedFiles[i].active) {
+            g_StagedFiles[i].hFile = hFile;
+            strncpy(g_StagedFiles[i].srcPath, srcPath, MAX_PATH - 1);
+            if (g_DragTargetFolderActive && g_DragTargetFolder[0]) {
+                snprintf(g_StagedFiles[i].destPath, MAX_PATH, "%s\\%s", g_DragTargetFolder, relPath);
+            } else {
+                g_StagedFiles[i].destPath[0] = 0;
+            }
+            g_StagedFiles[i].active = true;
+            g_LastTransferTick = GetTickCount();
+            break;
+        }
+    }
+    LeaveCriticalSection(&g_StagedLock);
 }
 
 static void InspectAndRepairRegistryKeyRecursive(HKEY hParent, int depth) {
@@ -314,7 +567,6 @@ static AkaiHandleContext g_Handles[MAX_AKAI_HANDLES];
 static LONG g_HandleCounter = 0;
 static GUID g_LastQueriedGuid = {0};
 
-// Forward declaration needed by Hook_CreateFileA
 static bool OpenAkaiWinUsbDevices();
 
 static bool IsAkaiHandle(HANDLE h) {
@@ -420,14 +672,43 @@ static BOOL WINAPI Hook_CloseHandle(HANDLE hObject) {
         FreeAkaiHandle(hObject);
         return TRUE;
     }
-    BOOL ok = CloseHandle(hObject);
-    if (g_InDragSession && g_DragTargetFolder[0] && g_LastWrittenFilePath[0] && g_LastWrittenFileName[0]) {
-        char destPath[MAX_PATH] = {0};
-        snprintf(destPath, sizeof(destPath), "%s\\%s", g_DragTargetFolder, g_LastWrittenFileName);
-        CopyFileA(g_LastWrittenFilePath, destPath, FALSE);
-        SHChangeNotify(SHCNE_CREATE, SHCNF_PATHA, destPath, NULL);
-        SHChangeNotify(SHCNE_UPDATEDIR, SHCNF_PATHA, g_DragTargetFolder, NULL);
+
+    char copySrc[MAX_PATH] = {0};
+    char copyDest[MAX_PATH] = {0};
+    bool shouldDeliver = false;
+
+    EnterCriticalSection(&g_StagedLock);
+    for (int i = 0; i < MAX_STAGED_FILES; i++) {
+        if (g_StagedFiles[i].active && g_StagedFiles[i].hFile == hObject) {
+            strncpy(copySrc, g_StagedFiles[i].srcPath, MAX_PATH - 1);
+            if (g_StagedFiles[i].destPath[0]) {
+                strncpy(copyDest, g_StagedFiles[i].destPath, MAX_PATH - 1);
+                shouldDeliver = true;
+            } else if (g_DragTargetFolderActive && g_DragTargetFolder[0]) {
+                char relPath[MAX_PATH] = {0};
+                GetRelativePathFromAksysOrName(copySrc, relPath, sizeof(relPath));
+                snprintf(copyDest, sizeof(copyDest), "%s\\%s", g_DragTargetFolder, relPath);
+                shouldDeliver = true;
+            } else if (g_InDragSession) {
+                if (g_PendingDropCount < MAX_PENDING_DROPS) {
+                    strncpy(g_PendingDrops[g_PendingDropCount].srcPath, copySrc, MAX_PATH - 1);
+                    GetRelativePathFromAksysOrName(copySrc, g_PendingDrops[g_PendingDropCount].relPath, MAX_PATH);
+                    g_PendingDropCount++;
+                }
+            }
+            g_StagedFiles[i].active = false;
+            g_StagedFiles[i].hFile = NULL;
+            break;
+        }
     }
+    LeaveCriticalSection(&g_StagedLock);
+
+    BOOL ok = CloseHandle(hObject);
+
+    if (shouldDeliver && copySrc[0] && copyDest[0]) {
+        DeliverFileToTarget(copySrc, copyDest);
+    }
+
     return ok;
 }
 
@@ -458,30 +739,26 @@ static HANDLE WINAPI Hook_CreateFileA(LPCSTR name, DWORD acc, DWORD share, LPSEC
         if ((acc & GENERIC_WRITE) || disp == CREATE_ALWAYS || disp == CREATE_NEW || disp == OPEN_ALWAYS) {
             share |= (FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE);
 
-            if (strstr(lower, "program files") != NULL && strstr(lower, "aksys") != NULL &&
-                strstr(lower, ".dll") == NULL && strstr(lower, ".exe") == NULL && strstr(lower, ".ini") == NULL) {
-                HANDLE hReal = CreateFileA(name, acc, share, sec, disp, flags, templ);
-                if (hReal != INVALID_HANDLE_VALUE) {
-                    RecordStagedFileAndDeliver(name);
-                    return hReal;
+            char relPath[MAX_PATH] = {0};
+            GetRelativePathFromAksysOrName(name, relPath, sizeof(relPath));
+
+            CreateParentDirectoryA(name);
+            HANDLE hReal = CreateFileA(name, acc, share, sec, disp, flags, templ);
+            if (hReal != INVALID_HANDLE_VALUE) {
+                RegisterStagedHandle(hReal, name, relPath);
+                return hReal;
+            }
+
+            char tempPath[MAX_PATH] = {0};
+            if (GetTempPathA(MAX_PATH, tempPath)) {
+                char redirectedPath[MAX_PATH] = {0};
+                snprintf(redirectedPath, sizeof(redirectedPath), "%sAKSys_Transfer_Cache\\%s", tempPath, relPath);
+                CreateParentDirectoryA(redirectedPath);
+                HANDLE hRedirected = CreateFileA(redirectedPath, acc, share, sec, disp, flags, templ);
+                if (hRedirected != INVALID_HANDLE_VALUE) {
+                    RegisterStagedHandle(hRedirected, redirectedPath, relPath);
+                    return hRedirected;
                 }
-                const char* lastSlash = strrchr(name, '\\');
-                if (!lastSlash) lastSlash = strrchr(name, '/');
-                const char* baseName = lastSlash ? (lastSlash + 1) : name;
-                if (baseName && baseName[0]) {
-                    char tempPath[MAX_PATH] = {0};
-                    if (GetTempPathA(MAX_PATH, tempPath)) {
-                        char stageDir[MAX_PATH] = {0};
-                        snprintf(stageDir, sizeof(stageDir), "%sAKSys_Transfer_Cache", tempPath);
-                        CreateDirectoryA(stageDir, NULL);
-                        char redirectedPath[MAX_PATH] = {0};
-                        snprintf(redirectedPath, sizeof(redirectedPath), "%s\\%s", stageDir, baseName);
-                        RecordStagedFileAndDeliver(redirectedPath);
-                        return CreateFileA(redirectedPath, acc, share, sec, disp, flags, templ);
-                    }
-                }
-            } else if (strstr(lower, ".wav") != NULL || strstr(lower, ".akp") != NULL || strstr(lower, ".akm") != NULL) {
-                RecordStagedFileAndDeliver(name);
             }
         }
     }
@@ -491,37 +768,9 @@ static HANDLE WINAPI Hook_CreateFileA(LPCSTR name, DWORD acc, DWORD share, LPSEC
 static HANDLE WINAPI Hook_CreateFileW(LPCWSTR name, DWORD acc, DWORD share, LPSECURITY_ATTRIBUTES sec,
                                      DWORD disp, DWORD flags, HANDLE templ) {
     if (name && ((acc & GENERIC_WRITE) || disp == CREATE_ALWAYS || disp == CREATE_NEW || disp == OPEN_ALWAYS)) {
-        share |= (FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE);
-        wchar_t lower[MAX_PATH] = {0};
-        wcsncpy(lower, name, MAX_PATH - 1);
-        _wcslwr(lower);
-        if (wcsstr(lower, L"program files") != NULL && wcsstr(lower, L"aksys") != NULL &&
-            wcsstr(lower, L".dll") == NULL && wcsstr(lower, L".exe") == NULL && wcsstr(lower, L".ini") == NULL) {
-            HANDLE hReal = CreateFileW(name, acc, share, sec, disp, flags, templ);
-            if (hReal != INVALID_HANDLE_VALUE) {
-                char ansiName[MAX_PATH] = {0};
-                WideCharToMultiByte(CP_ACP, 0, name, -1, ansiName, MAX_PATH - 1, NULL, NULL);
-                RecordStagedFileAndDeliver(ansiName);
-                return hReal;
-            }
-            const wchar_t* lastSlash = wcsrchr(name, L'\\');
-            if (!lastSlash) lastSlash = wcsrchr(name, L'/');
-            const wchar_t* baseName = lastSlash ? (lastSlash + 1) : name;
-            if (baseName && baseName[0]) {
-                wchar_t tempPath[MAX_PATH] = {0};
-                if (GetTempPathW(MAX_PATH, tempPath)) {
-                    wchar_t stageDir[MAX_PATH] = {0};
-                    _snwprintf(stageDir, MAX_PATH - 1, L"%sAKSys_Transfer_Cache", tempPath);
-                    CreateDirectoryW(stageDir, NULL);
-                    wchar_t redirectedPath[MAX_PATH] = {0};
-                    _snwprintf(redirectedPath, MAX_PATH - 1, L"%s\\%s", stageDir, baseName);
-                    char ansiName[MAX_PATH] = {0};
-                    WideCharToMultiByte(CP_ACP, 0, redirectedPath, -1, ansiName, MAX_PATH - 1, NULL, NULL);
-                    RecordStagedFileAndDeliver(ansiName);
-                    return CreateFileW(redirectedPath, acc, share, sec, disp, flags, templ);
-                }
-            }
-        }
+        char ansiName[MAX_PATH] = {0};
+        WideCharToMultiByte(CP_ACP, 0, name, -1, ansiName, MAX_PATH - 1, NULL, NULL);
+        return Hook_CreateFileA(ansiName, acc, share, sec, disp, flags, templ);
     }
     return CreateFileW(name, acc, share, sec, disp, flags, templ);
 }
@@ -823,99 +1072,63 @@ static BOOL WINAPI Hook_SetupDiDestroyDeviceInfoList(HDEVINFO s) {
 }
 
 static BOOL WINAPI Hook_MoveFileA(LPCSTR lpExisting, LPCSTR lpNew) {
+    if (!lpExisting || !lpNew) return FALSE;
+    CreateParentDirectoryA(lpNew);
     if (MoveFileA(lpExisting, lpNew)) {
-        if (lpNew) {
-            SHChangeNotify(SHCNE_CREATE, SHCNF_PATHA, lpNew, NULL);
-        }
+        SHChangeNotify(SHCNE_CREATE, SHCNF_PATHA, lpNew, NULL);
         return TRUE;
     }
-    if (lpExisting && lpNew) {
-        const char* lastSlash = strrchr(lpExisting, '\\');
-        if (!lastSlash) lastSlash = strrchr(lpExisting, '/');
-        const char* baseName = lastSlash ? (lastSlash + 1) : lpExisting;
-        char tempPath[MAX_PATH] = {0};
-        if (GetTempPathA(MAX_PATH, tempPath)) {
-            char redirectedSrc[MAX_PATH] = {0};
-            snprintf(redirectedSrc, sizeof(redirectedSrc), "%sAKSys_Transfer_Cache\\%s", tempPath, baseName);
-            if (MoveFileExA(redirectedSrc, lpNew, MOVEFILE_COPY_ALLOWED | MOVEFILE_REPLACE_EXISTING)) {
-                SHChangeNotify(SHCNE_CREATE, SHCNF_PATHA, lpNew, NULL);
-                return TRUE;
-            }
+    char relPath[MAX_PATH] = {0};
+    GetRelativePathFromAksysOrName(lpExisting, relPath, sizeof(relPath));
+    char tempPath[MAX_PATH] = {0};
+    if (GetTempPathA(MAX_PATH, tempPath)) {
+        char redirectedSrc[MAX_PATH] = {0};
+        snprintf(redirectedSrc, sizeof(redirectedSrc), "%sAKSys_Transfer_Cache\\%s", tempPath, relPath);
+        if (MoveFileExA(redirectedSrc, lpNew, MOVEFILE_COPY_ALLOWED | MOVEFILE_REPLACE_EXISTING)) {
+            SHChangeNotify(SHCNE_CREATE, SHCNF_PATHA, lpNew, NULL);
+            return TRUE;
         }
     }
     return FALSE;
 }
 
 static BOOL WINAPI Hook_MoveFileW(LPCWSTR lpExisting, LPCWSTR lpNew) {
-    if (MoveFileW(lpExisting, lpNew)) {
-        if (lpNew) {
-            SHChangeNotify(SHCNE_CREATE, SHCNF_PATHW, lpNew, NULL);
-        }
-        return TRUE;
-    }
-    if (lpExisting && lpNew) {
-        const wchar_t* lastSlash = wcsrchr(lpExisting, L'\\');
-        if (!lastSlash) lastSlash = wcsrchr(lpExisting, L'/');
-        const wchar_t* baseName = lastSlash ? (lastSlash + 1) : lpExisting;
-        wchar_t tempPath[MAX_PATH] = {0};
-        if (GetTempPathW(MAX_PATH, tempPath)) {
-            wchar_t redirectedSrc[MAX_PATH] = {0};
-            _snwprintf(redirectedSrc, MAX_PATH - 1, L"%sAKSys_Transfer_Cache\\%s", tempPath, baseName);
-            if (MoveFileExW(redirectedSrc, lpNew, MOVEFILE_COPY_ALLOWED | MOVEFILE_REPLACE_EXISTING)) {
-                SHChangeNotify(SHCNE_CREATE, SHCNF_PATHW, lpNew, NULL);
-                return TRUE;
-            }
-        }
-    }
-    return FALSE;
+    if (!lpExisting || !lpNew) return FALSE;
+    char ansiExist[MAX_PATH] = {0};
+    char ansiNew[MAX_PATH] = {0};
+    WideCharToMultiByte(CP_ACP, 0, lpExisting, -1, ansiExist, MAX_PATH - 1, NULL, NULL);
+    WideCharToMultiByte(CP_ACP, 0, lpNew, -1, ansiNew, MAX_PATH - 1, NULL, NULL);
+    return Hook_MoveFileA(ansiExist, ansiNew);
 }
 
 static BOOL WINAPI Hook_CopyFileA(LPCSTR lpExisting, LPCSTR lpNew, BOOL bFailIfExists) {
+    if (!lpExisting || !lpNew) return FALSE;
+    CreateParentDirectoryA(lpNew);
     if (CopyFileA(lpExisting, lpNew, bFailIfExists)) {
-        if (lpNew) {
-            SHChangeNotify(SHCNE_CREATE, SHCNF_PATHA, lpNew, NULL);
-        }
+        SHChangeNotify(SHCNE_CREATE, SHCNF_PATHA, lpNew, NULL);
         return TRUE;
     }
-    if (lpExisting && lpNew) {
-        const char* lastSlash = strrchr(lpExisting, '\\');
-        if (!lastSlash) lastSlash = strrchr(lpExisting, '/');
-        const char* baseName = lastSlash ? (lastSlash + 1) : lpExisting;
-        char tempPath[MAX_PATH] = {0};
-        if (GetTempPathA(MAX_PATH, tempPath)) {
-            char redirectedSrc[MAX_PATH] = {0};
-            snprintf(redirectedSrc, sizeof(redirectedSrc), "%sAKSys_Transfer_Cache\\%s", tempPath, baseName);
-            if (CopyFileA(redirectedSrc, lpNew, bFailIfExists)) {
-                SHChangeNotify(SHCNE_CREATE, SHCNF_PATHA, lpNew, NULL);
-                return TRUE;
-            }
+    char relPath[MAX_PATH] = {0};
+    GetRelativePathFromAksysOrName(lpExisting, relPath, sizeof(relPath));
+    char tempPath[MAX_PATH] = {0};
+    if (GetTempPathA(MAX_PATH, tempPath)) {
+        char redirectedSrc[MAX_PATH] = {0};
+        snprintf(redirectedSrc, sizeof(redirectedSrc), "%sAKSys_Transfer_Cache\\%s", tempPath, relPath);
+        if (CopyFileA(redirectedSrc, lpNew, bFailIfExists)) {
+            SHChangeNotify(SHCNE_CREATE, SHCNF_PATHA, lpNew, NULL);
+            return TRUE;
         }
     }
     return FALSE;
 }
 
 static BOOL WINAPI Hook_CopyFileW(LPCWSTR lpExisting, LPCWSTR lpNew, BOOL bFailIfExists) {
-    if (CopyFileW(lpExisting, lpNew, bFailIfExists)) {
-        if (lpNew) {
-            SHChangeNotify(SHCNE_CREATE, SHCNF_PATHW, lpNew, NULL);
-        }
-        return TRUE;
-    }
-    if (lpExisting && lpNew) {
-        const wchar_t* lastSlash = wcsrchr(lpExisting, L'\\');
-        if (!lastSlash) lastSlash = wcsrchr(lpExisting, L'/');
-        const wchar_t* baseName = lastSlash ? (lastSlash + 1) : lpExisting;
-        wchar_t tempPath[MAX_PATH] = {0};
-        if (GetTempPathW(MAX_PATH, tempPath)) {
-            wchar_t redirectedSrc[MAX_PATH] = {0};
-            _snwprintf(redirectedSrc, MAX_PATH - 1, L"%sAKSys_Transfer_Cache\\%s", tempPath, baseName);
-            if (CopyFileW(redirectedSrc, lpNew, bFailIfExists)) {
-                SHChangeNotify(SHCNE_CREATE, SHCNF_PATHW, lpNew, NULL);
-                return TRUE;
-            }
-        }
-    }
-    return FALSE;
+    if (!lpExisting || !lpNew) return FALSE;
+    char ansiExist[MAX_PATH] = {0};
+    char ansiNew[MAX_PATH] = {0};
+    WideCharToMultiByte(CP_ACP, 0, lpExisting, -1, ansiExist, MAX_PATH - 1, NULL, NULL);
+    WideCharToMultiByte(CP_ACP, 0, lpNew, -1, ansiNew, MAX_PATH - 1, NULL, NULL);
+    return Hook_CopyFileA(ansiExist, ansiNew, bFailIfExists);
 }
 
 static void CompletePendingReadForContext(AkaiHandleContext* ctx, DWORD gotBytes, BOOL ok) {
@@ -2269,14 +2482,14 @@ static DWORD WINAPI ZoomToolbarUIThread(LPVOID) {
     WNDCLASSA wc = {0};
     wc.lpfnWndProc = ZoomToolbarWndProc;
     wc.hInstance = GetModuleHandleA(NULL);
-    wc.lpszClassName = "AkaiZoomBarClassV150";
+    wc.lpszClassName = "AkaiZoomBarClassV156";
     wc.hCursor = LoadCursor(NULL, IDC_ARROW);
     wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
     RegisterClassA(&wc);
 
     g_hToolbarWidget = CreateWindowExA(WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
-                                       "AkaiZoomBarClassV150",
-                                       "ak.sys S5000/S6000/Z4/Z8/MPC4000 Zoom (v15.0)",
+                                       "AkaiZoomBarClassV156",
+                                       "ak.sys S5000/S6000/Z4/Z8/MPC4000 Zoom (v15.6)",
                                        WS_POPUP | WS_CAPTION | WS_VISIBLE | WS_BORDER | WS_SYSMENU,
                                        140, 90, 410, 106,
                                        NULL, NULL, GetModuleHandleA(NULL), NULL);
@@ -2338,6 +2551,8 @@ static void EnsureZoomToolbarRunning() {
 
 static void* ResolveHookFunction(const char* fn) {
     if (strcmp(fn, "DoDragDrop") == 0) return (void*)Hook_DoDragDrop;
+    if (strcmp(fn, "CreateDirectoryA") == 0) return (void*)Hook_CreateDirectoryA;
+    if (strcmp(fn, "CreateDirectoryW") == 0) return (void*)Hook_CreateDirectoryW;
     if (strcmp(fn, "CreateFileA") == 0) return (void*)Hook_CreateFileA;
     if (strcmp(fn, "CreateFileW") == 0) return (void*)Hook_CreateFileW;
     if (strcmp(fn, "MoveFileA") == 0) return (void*)Hook_MoveFileA;
@@ -2502,6 +2717,15 @@ static DWORD WINAPI WatcherThread(LPVOID) {
         ScanAndPatchAllLoadedModules();
         EnsureZoomToolbarRunning();
         ScanAndScaleAllSubWindows(g_CurrentGlobalZoom, false);
+
+        EnterCriticalSection(&g_StagedLock);
+        if (g_DragTargetFolderActive && g_LastTransferTick > 0) {
+            if (GetTickCount() - g_LastTransferTick > 25000) {
+                g_DragTargetFolderActive = false;
+                g_DragTargetFolder[0] = 0;
+            }
+        }
+        LeaveCriticalSection(&g_StagedLock);
     }
 
     return 0;
@@ -2589,9 +2813,13 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID reserved) {
         memset(g_Units, 0, sizeof(g_Units));
         memset(g_Handles, 0, sizeof(g_Handles));
         memset(g_ScaledWins, 0, sizeof(g_ScaledWins));
+        memset(g_StagedFiles, 0, sizeof(g_StagedFiles));
+        memset(g_PendingDrops, 0, sizeof(g_PendingDrops));
         g_UnitCount = 0;
         g_HandleCounter = 0;
+        g_PendingDropCount = 0;
         InitializeCriticalSection(&g_UsbLock);
+        InitializeCriticalSection(&g_StagedLock);
 
         CreateThread(NULL, 0, WatcherThread, NULL, 0, NULL);
     } else if (reason == DLL_PROCESS_DETACH) {
@@ -2605,6 +2833,8 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID reserved) {
                 CloseHandle(g_Units[u].hUsbDevice);
             }
         }
+        DeleteCriticalSection(&g_UsbLock);
+        DeleteCriticalSection(&g_StagedLock);
     }
     return TRUE;
 }
