@@ -1,6 +1,6 @@
 // ============================================================================
 // Akai S5000 / S6000 / Z4 / Z8 / MPC4000 Windows 11 64-Bit WinUSB Shim & Scaler
-// Version: v15.0 Production Release (Universal S56 + Z48 + MPC4000 Support)
+// Version: v15.5 Production Release (Direct Shell Drop Target Bridge)
 // File: akS56USB_WinUSB_Shim.cpp -> Compiles to version.dll (x86)
 // ============================================================================
 
@@ -16,6 +16,10 @@
 #include <intrin.h>
 #include <stdio.h>
 #include <math.h>
+#include <ole2.h>
+#include <shlobj.h>
+#include <exdisp.h>
+#include <shlwapi.h>
 
 #pragma comment(lib, "setupapi.lib")
 #pragma comment(lib, "winusb.lib")
@@ -23,6 +27,9 @@
 #pragma comment(lib, "gdi32.lib")
 #pragma comment(lib, "advapi32.lib")
 #pragma comment(lib, "ole32.lib")
+#pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "shlwapi.lib")
+#pragma comment(lib, "oleaut32.lib")
 
 #ifndef STATUS_SUCCESS
 #define STATUS_SUCCESS ((ULONG_PTR)0x00000000L)
@@ -42,12 +49,123 @@ DEFINE_GUID(GUID_DEVINTERFACE_WINUSB_DEF, 0x88BAE032L, 0x5A81, 0x49F0, 0xBC, 0x3
 static DWORD g_MainProcessId = 0;
 static DWORD g_MainThreadId = 0;
 static HMODULE g_hShimModule = NULL;
-static volatile bool g_EnableHdSharpening = true;
 
-// ----------------------------------------------------------------------------
-// Auto-Repair Collapsed Program Editor Registry Keys in HKCU\Software\AKSys\ak.Sys
-// Covers S5000, S6000, Z4, Z8, and MPC4000 registry trees
-// ----------------------------------------------------------------------------
+static bool g_InDragSession = false;
+static char g_DragTargetFolder[MAX_PATH] = {0};
+static char g_LastWrittenFilePath[MAX_PATH] = {0};
+static char g_LastWrittenFileName[MAX_PATH] = {0};
+
+static bool GetExplorerFolderPath(HWND hwndTarget, char* outPath, DWORD maxLen) {
+    if (!hwndTarget || !outPath || maxLen == 0) return false;
+    outPath[0] = 0;
+
+    HWND hwndDesktop = GetShellWindow();
+    HWND hwndProgman = FindWindowA("Progman", NULL);
+    HWND hwndWorkerW = FindWindowA("WorkerW", NULL);
+    HWND hRoot = GetAncestor(hwndTarget, GA_ROOT);
+
+    if (hwndTarget == hwndDesktop || hRoot == hwndDesktop ||
+        hwndTarget == hwndProgman || hRoot == hwndProgman ||
+        hwndTarget == hwndWorkerW || hRoot == hwndWorkerW) {
+        if (SUCCEEDED(SHGetFolderPathA(NULL, CSIDL_DESKTOPDIRECTORY, NULL, 0, outPath))) {
+            return (outPath[0] != 0);
+        }
+    }
+
+    IShellWindows* pShellWindows = NULL;
+    if (SUCCEEDED(CoCreateInstance(CLSID_ShellWindows, NULL, CLSCTX_ALL, IID_IShellWindows, (void**)&pShellWindows)) && pShellWindows) {
+        long count = 0;
+        pShellWindows->get_Count(&count);
+        for (long i = 0; i < count; i++) {
+            VARIANT v;
+            VariantInit(&v);
+            v.vt = VT_I4;
+            v.lVal = i;
+            IDispatch* pDisp = NULL;
+            if (SUCCEEDED(pShellWindows->Item(v, &pDisp)) && pDisp) {
+                IWebBrowserApp* pApp = NULL;
+                if (SUCCEEDED(pDisp->QueryInterface(IID_IWebBrowserApp, (void**)&pApp)) && pApp) {
+                    SHANDLE_PTR hExp = 0;
+                    pApp->get_HWND(&hExp);
+                    if ((HWND)hExp == hRoot || (HWND)hExp == hwndTarget) {
+                        BSTR bstrUrl = NULL;
+                        pApp->get_LocationURL(&bstrUrl);
+                        if (bstrUrl) {
+                            char urlStr[MAX_PATH] = {0};
+                            WideCharToMultiByte(CP_ACP, 0, bstrUrl, -1, urlStr, MAX_PATH - 1, NULL, NULL);
+                            SysFreeString(bstrUrl);
+                            DWORD pathLen = maxLen;
+                            if (PathCreateFromUrlA(urlStr, outPath, &pathLen, 0) == S_OK) {
+                                pApp->Release();
+                                pDisp->Release();
+                                pShellWindows->Release();
+                                return true;
+                            }
+                        }
+                    }
+                    pApp->Release();
+                }
+                pDisp->Release();
+            }
+        }
+        pShellWindows->Release();
+    }
+    return false;
+}
+
+static void RecordStagedFileAndDeliver(const char* fullPath) {
+    if (!fullPath || !fullPath[0]) return;
+    strncpy(g_LastWrittenFilePath, fullPath, MAX_PATH - 1);
+    const char* lastSlash = strrchr(fullPath, '\\');
+    if (!lastSlash) lastSlash = strrchr(fullPath, '/');
+    const char* baseName = lastSlash ? (lastSlash + 1) : fullPath;
+    strncpy(g_LastWrittenFileName, baseName, MAX_PATH - 1);
+
+    if (g_InDragSession && g_DragTargetFolder[0]) {
+        char destPath[MAX_PATH] = {0};
+        snprintf(destPath, sizeof(destPath), "%s\\%s", g_DragTargetFolder, g_LastWrittenFileName);
+        CopyFileA(g_LastWrittenFilePath, destPath, FALSE);
+        SHChangeNotify(SHCNE_CREATE, SHCNF_PATHA, destPath, NULL);
+        SHChangeNotify(SHCNE_UPDATEDIR, SHCNF_PATHA, g_DragTargetFolder, NULL);
+    }
+}
+
+typedef HRESULT (WINAPI *PFN_DoDragDrop)(LPDATAOBJECT, LPDROPSOURCE, DWORD, LPDWORD);
+static PFN_DoDragDrop g_realDoDragDrop = NULL;
+
+static HRESULT WINAPI Hook_DoDragDrop(LPDATAOBJECT pDataObj, LPDROPSOURCE pDropSource, DWORD dwOKEffects, LPDWORD pdwEffect) {
+    g_InDragSession = true;
+    g_DragTargetFolder[0] = 0;
+    g_LastWrittenFilePath[0] = 0;
+    g_LastWrittenFileName[0] = 0;
+
+    HRESULT hr = S_OK;
+    if (g_realDoDragDrop) {
+        hr = g_realDoDragDrop(pDataObj, pDropSource, dwOKEffects, pdwEffect);
+    } else {
+        hr = DoDragDrop(pDataObj, pDropSource, dwOKEffects, pdwEffect);
+    }
+
+    if (hr == DRAGDROP_S_DROP) {
+        POINT pt;
+        GetCursorPos(&pt);
+        HWND hwndDrop = WindowFromPoint(pt);
+        if (GetExplorerFolderPath(hwndDrop, g_DragTargetFolder, sizeof(g_DragTargetFolder))) {
+            if (g_LastWrittenFilePath[0] && g_LastWrittenFileName[0]) {
+                char destPath[MAX_PATH] = {0};
+                snprintf(destPath, sizeof(destPath), "%s\\%s", g_DragTargetFolder, g_LastWrittenFileName);
+                CopyFileA(g_LastWrittenFilePath, destPath, FALSE);
+                SHChangeNotify(SHCNE_CREATE, SHCNF_PATHA, destPath, NULL);
+                SHChangeNotify(SHCNE_UPDATEDIR, SHCNF_PATHA, g_DragTargetFolder, NULL);
+            }
+        }
+    }
+
+    Sleep(150);
+    g_InDragSession = false;
+    return hr;
+}
+
 static void InspectAndRepairRegistryKeyRecursive(HKEY hParent, int depth) {
     if (depth > 6) return;
     char valName[256];
@@ -103,30 +221,15 @@ static void RepairAkaiProgramEditorRegistry(bool forceResetLayouts) {
 
         if (forceResetLayouts) {
             const char* subKeysToClear[] = {
-                "S56\\Program Editor",
-                "S56\\Themes",
-                "S56\\Windows",
-                "S56",
-                "Z48\\Program Editor",
-                "Z48\\Themes",
-                "Z48\\Windows",
-                "Z48",
-                "MPC4000\\Program Editor",
-                "MPC4000\\Themes",
-                "MPC4000\\Windows",
-                "MPC4000",
-                "AKAI S6000\\Program Editor",
-                "AKAI S6000",
-                "AKAI S5000\\Program Editor",
-                "AKAI S5000",
-                "AKAI Z4\\Program Editor",
-                "AKAI Z4",
-                "AKAI Z8\\Program Editor",
-                "AKAI Z8",
-                "AKAI MPC4000\\Program Editor",
-                "AKAI MPC4000",
-                "Demo S56K 1",
-                "Demo S56K 2"
+                "S56\\Program Editor", "S56\\Themes", "S56\\Windows", "S56",
+                "Z48\\Program Editor", "Z48\\Themes", "Z48\\Windows", "Z48",
+                "MPC4000\\Program Editor", "MPC4000\\Themes", "MPC4000\\Windows", "MPC4000",
+                "AKAI S6000\\Program Editor", "AKAI S6000",
+                "AKAI S5000\\Program Editor", "AKAI S5000",
+                "AKAI Z4\\Program Editor", "AKAI Z4",
+                "AKAI Z8\\Program Editor", "AKAI Z8",
+                "AKAI MPC4000\\Program Editor", "AKAI MPC4000",
+                "Demo S56K 1", "Demo S56K 2"
             };
             for (int i = 0; i < (int)(sizeof(subKeysToClear) / sizeof(subKeysToClear[0])); i++) {
                 RegDeleteKeyA(hAkSys, subKeysToClear[i]);
@@ -141,33 +244,25 @@ static void EnableDpiAwareness() {
     if (hUser) {
         typedef BOOL (WINAPI *PFN_SetProcessDPIAware)(VOID);
         PFN_SetProcessDPIAware pfnDPIAware = (PFN_SetProcessDPIAware)GetProcAddress(hUser, "SetProcessDPIAware");
-        if (pfnDPIAware) {
-            pfnDPIAware();
-        }
+        if (pfnDPIAware) pfnDPIAware();
     }
     HMODULE hShcore = LoadLibraryA("Shcore.dll");
     if (hShcore) {
         typedef HRESULT (WINAPI *PFN_SetProcessDpiAwareness)(int);
         PFN_SetProcessDpiAwareness pfnAwareness = (PFN_SetProcessDpiAwareness)GetProcAddress(hShcore, "SetProcessDpiAwareness");
-        if (pfnAwareness) {
-            pfnAwareness(2);
-        }
+        if (pfnAwareness) pfnAwareness(2);
     }
 }
 
-// ----------------------------------------------------------------------------
-// Multi-Device WinUSB Hardware Layer (S5000, S6000, Z4, Z8, MPC4000)
-// Supports simultaneous connections and auto-discovers Bulk IN/OUT pipes
-// ----------------------------------------------------------------------------
 #define MAX_AKAI_UNITS 16
 #define MAX_AKAI_HANDLES 128
 #define AKAI_HANDLE_BASE 0x414B5300
-#define AKAI_READ_BUFFER_SIZE 65536
+#define AKAI_READ_BUFFER_SIZE 262144
 
 enum AkaiDeviceFamily {
     FAMILY_ANY = 0,
-    FAMILY_S56,     // S5000 / S6000 (PID 005E)
-    FAMILY_Z48,     // Z4 / Z8 / MPC4000 (Z48Device.dll / MPC4K)
+    FAMILY_S56,
+    FAMILY_Z48,
     FAMILY_MPC4000
 };
 
@@ -188,9 +283,9 @@ struct AkaiUsbUnit {
 enum AkaiHandleType {
     HANDLE_TYPE_UNUSED = 0,
     HANDLE_TYPE_ROOT,
-    HANDLE_TYPE_PIPE0,  // Bulk IN (Device -> Host)
-    HANDLE_TYPE_PIPE1,  // Bulk OUT (Host -> Device)
-    HANDLE_TYPE_PIPE2   // Optional Interrupt / Auxiliary pipe
+    HANDLE_TYPE_PIPE0,
+    HANDLE_TYPE_PIPE1,
+    HANDLE_TYPE_PIPE2
 };
 
 struct AkaiHandleContext {
@@ -206,6 +301,8 @@ struct AkaiHandleContext {
     LPVOID pUserDest;
     DWORD userReqLen;
     LPOVERLAPPED pUserOv;
+    DWORD lastBytesTransferred;
+    BOOL lastResultOk;
 };
 
 static CRITICAL_SECTION g_UsbLock;
@@ -216,6 +313,9 @@ static volatile bool g_DeviceDllHooked = false;
 static AkaiHandleContext g_Handles[MAX_AKAI_HANDLES];
 static LONG g_HandleCounter = 0;
 static GUID g_LastQueriedGuid = {0};
+
+// Forward declaration needed by Hook_CreateFileA
+static bool OpenAkaiWinUsbDevices();
 
 static bool IsAkaiHandle(HANDLE h) {
     ULONG_PTR val = (ULONG_PTR)h;
@@ -235,7 +335,6 @@ static int SelectBestUnitForPath(const char* name) {
     strncpy(lower, name, sizeof(lower) - 1);
     _strlwr(lower);
 
-    // Check explicit unit index encoded in our fake path (e.g. #unit0#, #unit1#)
     const char* pUnit = strstr(lower, "#unit");
     if (pUnit) {
         int idx = atoi(pUnit + 5);
@@ -244,7 +343,6 @@ static int SelectBestUnitForPath(const char* name) {
         }
     }
 
-    // Match by family hints if multiple Akai samplers are connected simultaneously
     bool wantsS56 = (strstr(lower, "s56") != NULL || strstr(lower, "005e") != NULL);
     bool wantsZ48 = (strstr(lower, "z48") != NULL || strstr(lower, "mpc") != NULL ||
                      strstr(lower, "z4") != NULL  || strstr(lower, "z8") != NULL);
@@ -282,6 +380,8 @@ static HANDLE AllocateAkaiHandle(AkaiHandleType type, int unitIndex, const char*
             g_Handles[i].pUserDest = NULL;
             g_Handles[i].userReqLen = 0;
             g_Handles[i].pUserOv = NULL;
+            g_Handles[i].lastBytesTransferred = 0;
+            g_Handles[i].lastResultOk = TRUE;
             if (!g_Handles[i].hEvent) {
                 g_Handles[i].hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
                 memset(&g_Handles[i].winusbOv, 0, sizeof(OVERLAPPED));
@@ -315,6 +415,117 @@ static void FreeAkaiHandle(HANDLE h) {
     LeaveCriticalSection(&g_UsbLock);
 }
 
+static BOOL WINAPI Hook_CloseHandle(HANDLE hObject) {
+    if (IsAkaiHandle(hObject)) {
+        FreeAkaiHandle(hObject);
+        return TRUE;
+    }
+    BOOL ok = CloseHandle(hObject);
+    if (g_InDragSession && g_DragTargetFolder[0] && g_LastWrittenFilePath[0] && g_LastWrittenFileName[0]) {
+        char destPath[MAX_PATH] = {0};
+        snprintf(destPath, sizeof(destPath), "%s\\%s", g_DragTargetFolder, g_LastWrittenFileName);
+        CopyFileA(g_LastWrittenFilePath, destPath, FALSE);
+        SHChangeNotify(SHCNE_CREATE, SHCNF_PATHA, destPath, NULL);
+        SHChangeNotify(SHCNE_UPDATEDIR, SHCNF_PATHA, g_DragTargetFolder, NULL);
+    }
+    return ok;
+}
+
+static HANDLE WINAPI Hook_CreateFileA(LPCSTR name, DWORD acc, DWORD share, LPSECURITY_ATTRIBUTES sec,
+                                     DWORD disp, DWORD flags, HANDLE templ) {
+    if (name) {
+        char lower[MAX_PATH] = {0};
+        strncpy(lower, name, sizeof(lower) - 1);
+        _strlwr(lower);
+
+        if (strstr(lower, "aks56") || strstr(lower, "akz48") || strstr(lower, "akmpc") ||
+            strstr(lower, "vid_09e8") || strstr(lower, "9d4b6529")) {
+            OpenAkaiWinUsbDevices();
+            int unitIdx = SelectBestUnitForPath(lower);
+
+            if (strstr(lower, "pipe00") || strstr(lower, "pipe_00") || strstr(lower, "pipe0")) {
+                return AllocateAkaiHandle(HANDLE_TYPE_PIPE0, unitIdx, name);
+            }
+            if (strstr(lower, "pipe01") || strstr(lower, "pipe_01") || strstr(lower, "pipe1")) {
+                return AllocateAkaiHandle(HANDLE_TYPE_PIPE1, unitIdx, name);
+            }
+            if (strstr(lower, "pipe02") || strstr(lower, "pipe_02") || strstr(lower, "pipe2")) {
+                return AllocateAkaiHandle(HANDLE_TYPE_PIPE2, unitIdx, name);
+            }
+            return AllocateAkaiHandle(HANDLE_TYPE_ROOT, unitIdx, name);
+        }
+
+        if ((acc & GENERIC_WRITE) || disp == CREATE_ALWAYS || disp == CREATE_NEW || disp == OPEN_ALWAYS) {
+            share |= (FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE);
+
+            if (strstr(lower, "program files") != NULL && strstr(lower, "aksys") != NULL &&
+                strstr(lower, ".dll") == NULL && strstr(lower, ".exe") == NULL && strstr(lower, ".ini") == NULL) {
+                HANDLE hReal = CreateFileA(name, acc, share, sec, disp, flags, templ);
+                if (hReal != INVALID_HANDLE_VALUE) {
+                    RecordStagedFileAndDeliver(name);
+                    return hReal;
+                }
+                const char* lastSlash = strrchr(name, '\\');
+                if (!lastSlash) lastSlash = strrchr(name, '/');
+                const char* baseName = lastSlash ? (lastSlash + 1) : name;
+                if (baseName && baseName[0]) {
+                    char tempPath[MAX_PATH] = {0};
+                    if (GetTempPathA(MAX_PATH, tempPath)) {
+                        char stageDir[MAX_PATH] = {0};
+                        snprintf(stageDir, sizeof(stageDir), "%sAKSys_Transfer_Cache", tempPath);
+                        CreateDirectoryA(stageDir, NULL);
+                        char redirectedPath[MAX_PATH] = {0};
+                        snprintf(redirectedPath, sizeof(redirectedPath), "%s\\%s", stageDir, baseName);
+                        RecordStagedFileAndDeliver(redirectedPath);
+                        return CreateFileA(redirectedPath, acc, share, sec, disp, flags, templ);
+                    }
+                }
+            } else if (strstr(lower, ".wav") != NULL || strstr(lower, ".akp") != NULL || strstr(lower, ".akm") != NULL) {
+                RecordStagedFileAndDeliver(name);
+            }
+        }
+    }
+    return CreateFileA(name, acc, share, sec, disp, flags, templ);
+}
+
+static HANDLE WINAPI Hook_CreateFileW(LPCWSTR name, DWORD acc, DWORD share, LPSECURITY_ATTRIBUTES sec,
+                                     DWORD disp, DWORD flags, HANDLE templ) {
+    if (name && ((acc & GENERIC_WRITE) || disp == CREATE_ALWAYS || disp == CREATE_NEW || disp == OPEN_ALWAYS)) {
+        share |= (FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE);
+        wchar_t lower[MAX_PATH] = {0};
+        wcsncpy(lower, name, MAX_PATH - 1);
+        _wcslwr(lower);
+        if (wcsstr(lower, L"program files") != NULL && wcsstr(lower, L"aksys") != NULL &&
+            wcsstr(lower, L".dll") == NULL && wcsstr(lower, L".exe") == NULL && wcsstr(lower, L".ini") == NULL) {
+            HANDLE hReal = CreateFileW(name, acc, share, sec, disp, flags, templ);
+            if (hReal != INVALID_HANDLE_VALUE) {
+                char ansiName[MAX_PATH] = {0};
+                WideCharToMultiByte(CP_ACP, 0, name, -1, ansiName, MAX_PATH - 1, NULL, NULL);
+                RecordStagedFileAndDeliver(ansiName);
+                return hReal;
+            }
+            const wchar_t* lastSlash = wcsrchr(name, L'\\');
+            if (!lastSlash) lastSlash = wcsrchr(name, L'/');
+            const wchar_t* baseName = lastSlash ? (lastSlash + 1) : name;
+            if (baseName && baseName[0]) {
+                wchar_t tempPath[MAX_PATH] = {0};
+                if (GetTempPathW(MAX_PATH, tempPath)) {
+                    wchar_t stageDir[MAX_PATH] = {0};
+                    _snwprintf(stageDir, MAX_PATH - 1, L"%sAKSys_Transfer_Cache", tempPath);
+                    CreateDirectoryW(stageDir, NULL);
+                    wchar_t redirectedPath[MAX_PATH] = {0};
+                    _snwprintf(redirectedPath, MAX_PATH - 1, L"%s\\%s", stageDir, baseName);
+                    char ansiName[MAX_PATH] = {0};
+                    WideCharToMultiByte(CP_ACP, 0, redirectedPath, -1, ansiName, MAX_PATH - 1, NULL, NULL);
+                    RecordStagedFileAndDeliver(ansiName);
+                    return CreateFileW(redirectedPath, acc, share, sec, disp, flags, templ);
+                }
+            }
+        }
+    }
+    return CreateFileW(name, acc, share, sec, disp, flags, templ);
+}
+
 static bool IsUnitAlreadyOpen(const char* devPath) {
     for (int i = 0; i < g_UnitCount; i++) {
         if (g_Units[i].active && _stricmp(g_Units[i].winUsbDevicePath, devPath) == 0) {
@@ -341,14 +552,16 @@ static bool ConfigureWinUsbUnit(HANDLE hDev, const char* devPath, const char* hw
         for (UCHAR p = 0; p < ifaceDesc.bNumEndpoints; p++) {
             WINUSB_PIPE_INFORMATION pipeInfo;
             if (WinUsb_QueryPipe(hWinUsb, 0, p, &pipeInfo)) {
-                ULONG timeout = 5000;
+                ULONG timeout = 15000;
                 UCHAR autoClear = 1;
                 UCHAR rawIo = 0;
-                UCHAR shortPacket = 1;
+                UCHAR shortPacket = 0;
                 WinUsb_SetPipePolicy(hWinUsb, pipeInfo.PipeId, PIPE_TRANSFER_TIMEOUT, sizeof(ULONG), &timeout);
                 WinUsb_SetPipePolicy(hWinUsb, pipeInfo.PipeId, AUTO_CLEAR_STALL, sizeof(UCHAR), &autoClear);
                 WinUsb_SetPipePolicy(hWinUsb, pipeInfo.PipeId, RAW_IO, sizeof(UCHAR), &rawIo);
-                WinUsb_SetPipePolicy(hWinUsb, pipeInfo.PipeId, SHORT_PACKET_TERMINATE, sizeof(UCHAR), &shortPacket);
+                if (!USB_ENDPOINT_DIRECTION_IN(pipeInfo.PipeId)) {
+                    WinUsb_SetPipePolicy(hWinUsb, pipeInfo.PipeId, SHORT_PACKET_TERMINATE, sizeof(UCHAR), &shortPacket);
+                }
 
                 if (pipeInfo.PipeType == UsbdPipeTypeBulk) {
                     if (USB_ENDPOINT_DIRECTION_IN(pipeInfo.PipeId)) {
@@ -363,7 +576,6 @@ static bool ConfigureWinUsbUnit(HANDLE hDev, const char* devPath, const char* hw
         }
     }
 
-    // Fallback to standard Akai Bulk endpoints (0x82 IN, 0x02 OUT) if descriptor query was minimal
     if (!foundBulkIn)  foundBulkIn  = 0x82;
     if (!foundBulkOut) foundBulkOut = 0x02;
 
@@ -395,7 +607,6 @@ static bool ConfigureWinUsbUnit(HANDLE hDev, const char* devPath, const char* hw
         }
     }
 
-    // Construct a universal fake path containing tokens recognized by S56Device.dll, Z48Device.dll, and MPC4K
     snprintf(u->fakeAkaiPath, sizeof(u->fakeAkaiPath),
              "\\\\?\\usb#vid_09e8&pid_%04x#unit%d_aks56usb_akz48usb_mpc4000#{9d4b6529-d4a6-11d3-8eae-0050da2e2d53}",
              u->pid, idx);
@@ -429,7 +640,6 @@ static bool ScanAllUsbDevicesUniversal() {
         char hwId[512] = {0};
         if (SetupDiGetDeviceRegistryPropertyA(hDevInfo, &devData, SPDRP_HARDWAREID, NULL, (PBYTE)hwId, sizeof(hwId) - 1, NULL)) {
             _strlwr(hwId);
-            // Match any Akai Professional USB device (VID_09E8: S5000, S6000, Z4, Z8, MPC4000)
             if (strstr(hwId, "vid_09e8") != NULL) {
                 char instanceId[MAX_PATH] = {0};
                 if (SetupDiGetDeviceInstanceIdA(hDevInfo, &devData, instanceId, sizeof(instanceId) - 1, NULL)) {
@@ -439,7 +649,6 @@ static bool ScanAllUsbDevicesUniversal() {
                         if (symInstance[c] == '\\') symInstance[c] = '#';
                     }
 
-                    // Also check Custom DeviceInterfaceGUIDs registered by Zadig / WinUSB in the registry
                     char customGuidStr[128] = {0};
                     HKEY hDevReg = SetupDiOpenDevRegKey(hDevInfo, &devData, DICS_FLAG_GLOBAL, 0, DIREG_DEV, KEY_READ);
                     if (hDevReg != INVALID_HANDLE_VALUE) {
@@ -452,9 +661,9 @@ static bool ScanAllUsbDevicesUniversal() {
                     }
 
                     const char* guidStrings[] = {
-                        "{a5dcbf10-6530-11d2-901f-00c04fb951ed}", // Standard USB Device GUID
-                        "{88bae032-5a81-49f0-bc3d-a4ff138216d6}", // Standard Zadig WinUSB GUID
-                        "{9d4b6529-d4a6-11d3-8eae-0050da2e2d53}", // Akai S56/Z48 Legacy GUID
+                        "{a5dcbf10-6530-11d2-901f-00c04fb951ed}",
+                        "{88bae032-5a81-49f0-bc3d-a4ff138216d6}",
+                        "{9d4b6529-d4a6-11d3-8eae-0050da2e2d53}",
                         customGuidStr[0] ? customGuidStr : NULL
                     };
 
@@ -495,9 +704,6 @@ static BOOL CompleteIoOperation(LPOVERLAPPED lpOverlapped, DWORD bytesTransferre
     return ok;
 }
 
-// ----------------------------------------------------------------------------
-// SetupAPI & File I/O Hooks for S56, Z48, and MPC4000 Device DLLs
-// ----------------------------------------------------------------------------
 #define FAKE_HDEVINFO ((HDEVINFO)(ULONG_PTR)0x414B0001)
 
 typedef HDEVINFO (WINAPI *PFN_SetupDiGetClassDevsA)(const GUID*, PCSTR, HWND, DWORD);
@@ -555,7 +761,6 @@ static bool IsAkaiDeviceCaller(void* retAddr) {
 }
 
 static HDEVINFO WINAPI Hook_SetupDiGetClassDevsA(const GUID* g, PCSTR e, HWND h, DWORD f) {
-    // Intercept device interface queries from S56Device.dll, Z48Device.dll, MPC4000, or matching GUID
     if (g && (g->Data1 == 0x9D4B6529L ||
               memcmp(g, &GUID_DEVINTERFACE_AKAI_S56, sizeof(GUID)) == 0 ||
               ((f & DIGCF_DEVICEINTERFACE) && IsAkaiDeviceCaller(_ReturnAddress())))) {
@@ -617,39 +822,108 @@ static BOOL WINAPI Hook_SetupDiDestroyDeviceInfoList(HDEVINFO s) {
     return SetupDiDestroyDeviceInfoList(s);
 }
 
-static HANDLE WINAPI Hook_CreateFileA(LPCSTR name, DWORD acc, DWORD share, LPSECURITY_ATTRIBUTES sec,
-                                     DWORD disp, DWORD flags, HANDLE templ) {
-    if (name) {
-        char lower[256] = {0};
-        strncpy(lower, name, sizeof(lower) - 1);
-        _strlwr(lower);
-
-        // Match S5000/S6000 (aks56), Z4/Z8 (akz48), MPC4000 (akmpc), or any Akai VID_09E8 device path
-        if (strstr(lower, "aks56") || strstr(lower, "akz48") || strstr(lower, "akmpc") ||
-            strstr(lower, "vid_09e8") || strstr(lower, "9d4b6529")) {
-            OpenAkaiWinUsbDevices();
-            int unitIdx = SelectBestUnitForPath(lower);
-
-            // Detect endpoint pipe suffixes used by Akai WDM USB drivers (PIPE00 / PIPE01 / PIPE_00 / PIPE_01 / Pipe0 / Pipe1)
-            if (strstr(lower, "pipe00") || strstr(lower, "pipe_00") || strstr(lower, "pipe0")) {
-                return AllocateAkaiHandle(HANDLE_TYPE_PIPE0, unitIdx, name);
+static BOOL WINAPI Hook_MoveFileA(LPCSTR lpExisting, LPCSTR lpNew) {
+    if (MoveFileA(lpExisting, lpNew)) {
+        if (lpNew) {
+            SHChangeNotify(SHCNE_CREATE, SHCNF_PATHA, lpNew, NULL);
+        }
+        return TRUE;
+    }
+    if (lpExisting && lpNew) {
+        const char* lastSlash = strrchr(lpExisting, '\\');
+        if (!lastSlash) lastSlash = strrchr(lpExisting, '/');
+        const char* baseName = lastSlash ? (lastSlash + 1) : lpExisting;
+        char tempPath[MAX_PATH] = {0};
+        if (GetTempPathA(MAX_PATH, tempPath)) {
+            char redirectedSrc[MAX_PATH] = {0};
+            snprintf(redirectedSrc, sizeof(redirectedSrc), "%sAKSys_Transfer_Cache\\%s", tempPath, baseName);
+            if (MoveFileExA(redirectedSrc, lpNew, MOVEFILE_COPY_ALLOWED | MOVEFILE_REPLACE_EXISTING)) {
+                SHChangeNotify(SHCNE_CREATE, SHCNF_PATHA, lpNew, NULL);
+                return TRUE;
             }
-            if (strstr(lower, "pipe01") || strstr(lower, "pipe_01") || strstr(lower, "pipe1")) {
-                return AllocateAkaiHandle(HANDLE_TYPE_PIPE1, unitIdx, name);
-            }
-            if (strstr(lower, "pipe02") || strstr(lower, "pipe_02") || strstr(lower, "pipe2")) {
-                return AllocateAkaiHandle(HANDLE_TYPE_PIPE2, unitIdx, name);
-            }
-            return AllocateAkaiHandle(HANDLE_TYPE_ROOT, unitIdx, name);
         }
     }
-    return CreateFileA(name, acc, share, sec, disp, flags, templ);
+    return FALSE;
+}
+
+static BOOL WINAPI Hook_MoveFileW(LPCWSTR lpExisting, LPCWSTR lpNew) {
+    if (MoveFileW(lpExisting, lpNew)) {
+        if (lpNew) {
+            SHChangeNotify(SHCNE_CREATE, SHCNF_PATHW, lpNew, NULL);
+        }
+        return TRUE;
+    }
+    if (lpExisting && lpNew) {
+        const wchar_t* lastSlash = wcsrchr(lpExisting, L'\\');
+        if (!lastSlash) lastSlash = wcsrchr(lpExisting, L'/');
+        const wchar_t* baseName = lastSlash ? (lastSlash + 1) : lpExisting;
+        wchar_t tempPath[MAX_PATH] = {0};
+        if (GetTempPathW(MAX_PATH, tempPath)) {
+            wchar_t redirectedSrc[MAX_PATH] = {0};
+            _snwprintf(redirectedSrc, MAX_PATH - 1, L"%sAKSys_Transfer_Cache\\%s", tempPath, baseName);
+            if (MoveFileExW(redirectedSrc, lpNew, MOVEFILE_COPY_ALLOWED | MOVEFILE_REPLACE_EXISTING)) {
+                SHChangeNotify(SHCNE_CREATE, SHCNF_PATHW, lpNew, NULL);
+                return TRUE;
+            }
+        }
+    }
+    return FALSE;
+}
+
+static BOOL WINAPI Hook_CopyFileA(LPCSTR lpExisting, LPCSTR lpNew, BOOL bFailIfExists) {
+    if (CopyFileA(lpExisting, lpNew, bFailIfExists)) {
+        if (lpNew) {
+            SHChangeNotify(SHCNE_CREATE, SHCNF_PATHA, lpNew, NULL);
+        }
+        return TRUE;
+    }
+    if (lpExisting && lpNew) {
+        const char* lastSlash = strrchr(lpExisting, '\\');
+        if (!lastSlash) lastSlash = strrchr(lpExisting, '/');
+        const char* baseName = lastSlash ? (lastSlash + 1) : lpExisting;
+        char tempPath[MAX_PATH] = {0};
+        if (GetTempPathA(MAX_PATH, tempPath)) {
+            char redirectedSrc[MAX_PATH] = {0};
+            snprintf(redirectedSrc, sizeof(redirectedSrc), "%sAKSys_Transfer_Cache\\%s", tempPath, baseName);
+            if (CopyFileA(redirectedSrc, lpNew, bFailIfExists)) {
+                SHChangeNotify(SHCNE_CREATE, SHCNF_PATHA, lpNew, NULL);
+                return TRUE;
+            }
+        }
+    }
+    return FALSE;
+}
+
+static BOOL WINAPI Hook_CopyFileW(LPCWSTR lpExisting, LPCWSTR lpNew, BOOL bFailIfExists) {
+    if (CopyFileW(lpExisting, lpNew, bFailIfExists)) {
+        if (lpNew) {
+            SHChangeNotify(SHCNE_CREATE, SHCNF_PATHW, lpNew, NULL);
+        }
+        return TRUE;
+    }
+    if (lpExisting && lpNew) {
+        const wchar_t* lastSlash = wcsrchr(lpExisting, L'\\');
+        if (!lastSlash) lastSlash = wcsrchr(lpExisting, L'/');
+        const wchar_t* baseName = lastSlash ? (lastSlash + 1) : lpExisting;
+        wchar_t tempPath[MAX_PATH] = {0};
+        if (GetTempPathW(MAX_PATH, tempPath)) {
+            wchar_t redirectedSrc[MAX_PATH] = {0};
+            _snwprintf(redirectedSrc, MAX_PATH - 1, L"%sAKSys_Transfer_Cache\\%s", tempPath, baseName);
+            if (CopyFileW(redirectedSrc, lpNew, bFailIfExists)) {
+                SHChangeNotify(SHCNE_CREATE, SHCNF_PATHW, lpNew, NULL);
+                return TRUE;
+            }
+        }
+    }
+    return FALSE;
 }
 
 static void CompletePendingReadForContext(AkaiHandleContext* ctx, DWORD gotBytes, BOOL ok) {
     ctx->readPending = false;
     ResetEvent(ctx->hEvent);
-    g_LastBytesTransferred = gotBytes;
+    ctx->lastBytesTransferred = ok ? gotBytes : 0;
+    ctx->lastResultOk = ok;
+    g_LastBytesTransferred = ctx->lastBytesTransferred;
 
     if (ok && gotBytes > 0) {
         if (ctx->pUserDest) {
@@ -697,7 +971,8 @@ static BOOL WINAPI Hook_WriteFile(HANDLE hFile, LPCVOID buf, DWORD len, LPDWORD 
 
     int idx = GetAkaiHandleIndex(hFile);
     if (idx < 0) return CompleteIoOperation(ov, 0, FALSE);
-    int uIdx = g_Handles[idx].unitIndex;
+    AkaiHandleContext* ctx = &g_Handles[idx];
+    int uIdx = ctx->unitIndex;
     WINUSB_INTERFACE_HANDLE hWinUsb = (uIdx >= 0 && uIdx < MAX_AKAI_UNITS) ? g_Units[uIdx].hWinUsb : NULL;
     UCHAR outPipe = (uIdx >= 0 && uIdx < MAX_AKAI_UNITS && g_Units[uIdx].active) ? g_Units[uIdx].bulkOutPipe : 0x02;
 
@@ -707,23 +982,45 @@ static BOOL WINAPI Hook_WriteFile(HANDLE hFile, LPCVOID buf, DWORD len, LPDWORD 
         if (ov->hEvent) ResetEvent(ov->hEvent);
     }
 
-    ULONG transferred = 0;
+    ULONG totalWritten = 0;
     BOOL ok = FALSE;
 
-    if (hWinUsb) {
+    if (hWinUsb && buf && len > 0) {
+        const PUCHAR pSrc = (const PUCHAR)buf;
+        DWORD remaining = len;
+        ok = TRUE;
+
         OVERLAPPED localOv;
         memset(&localOv, 0, sizeof(localOv));
         localOv.hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
 
-        ok = WinUsb_WritePipe(hWinUsb, outPipe, (PUCHAR)buf, len, &transferred, &localOv);
-        if (!ok && GetLastError() == ERROR_IO_PENDING) {
-            ok = WinUsb_GetOverlappedResult(hWinUsb, &localOv, &transferred, TRUE);
+        while (remaining > 0) {
+            DWORD chunk = (remaining > 32768) ? 32768 : remaining;
+            ULONG transferred = 0;
+            ResetEvent(localOv.hEvent);
+
+            BOOL wOk = WinUsb_WritePipe(hWinUsb, outPipe, (PUCHAR)(pSrc + totalWritten), chunk, &transferred, &localOv);
+            if (!wOk && GetLastError() == ERROR_IO_PENDING) {
+                wOk = WinUsb_GetOverlappedResult(hWinUsb, &localOv, &transferred, TRUE);
+            }
+            if (!wOk) {
+                WinUsb_ResetPipe(hWinUsb, outPipe);
+                ok = FALSE;
+                break;
+            }
+            totalWritten += transferred;
+            if (transferred == 0) break;
+            remaining -= transferred;
         }
         CloseHandle(localOv.hEvent);
+    } else if (hWinUsb && len == 0) {
+        ok = TRUE;
     }
 
-    if (written) *written = len;
-    return CompleteIoOperation(ov, len, ok);
+    ctx->lastBytesTransferred = ok ? totalWritten : 0;
+    ctx->lastResultOk = ok;
+    if (written) *written = ctx->lastBytesTransferred;
+    return CompleteIoOperation(ov, ctx->lastBytesTransferred, ok);
 }
 
 static BOOL WINAPI Hook_ReadFile(HANDLE hFile, LPVOID buf, DWORD len, LPDWORD readBytes, LPOVERLAPPED ov) {
@@ -751,13 +1048,13 @@ static BOOL WINAPI Hook_ReadFile(HANDLE hFile, LPVOID buf, DWORD len, LPDWORD re
         if (ov->hEvent) ResetEvent(ov->hEvent);
     }
 
-    ULONG transferred = 0;
+    ULONG totalRead = 0;
     BOOL ok = FALSE;
 
     if (ctx->readPending) {
         DWORD waitRes = WaitForSingleObject(ctx->hEvent, 20);
         if (waitRes == WAIT_OBJECT_0) {
-            ok = WinUsb_GetOverlappedResult(hWinUsb, &ctx->winusbOv, &transferred, FALSE);
+            ok = WinUsb_GetOverlappedResult(hWinUsb, &ctx->winusbOv, &totalRead, FALSE);
             ctx->readPending = false;
             ResetEvent(ctx->hEvent);
         } else {
@@ -771,20 +1068,21 @@ static BOOL WINAPI Hook_ReadFile(HANDLE hFile, LPVOID buf, DWORD len, LPDWORD re
     }
 
     if (!ctx->readPending && !ok) {
-        ULONG readReq = (len > AKAI_READ_BUFFER_SIZE) ? AKAI_READ_BUFFER_SIZE : len;
+        ULONG firstReq = (len > AKAI_READ_BUFFER_SIZE) ? AKAI_READ_BUFFER_SIZE : len;
+        if (firstReq > 32768) firstReq = 32768;
 
         ResetEvent(ctx->hEvent);
         memset(&ctx->winusbOv, 0, sizeof(OVERLAPPED));
         ctx->winusbOv.hEvent = ctx->hEvent;
 
-        ok = WinUsb_ReadPipe(hWinUsb, inPipe, ctx->readBuffer, readReq, &transferred, &ctx->winusbOv);
+        ok = WinUsb_ReadPipe(hWinUsb, inPipe, ctx->readBuffer, firstReq, &totalRead, &ctx->winusbOv);
         DWORD err = GetLastError();
 
         if (!ok && err == ERROR_IO_PENDING) {
-            DWORD initialWait = (len >= 512) ? 500 : 25;
+            DWORD initialWait = (len >= 512) ? 2000 : 25;
             DWORD waitRes = WaitForSingleObject(ctx->hEvent, initialWait);
             if (waitRes == WAIT_OBJECT_0) {
-                ok = WinUsb_GetOverlappedResult(hWinUsb, &ctx->winusbOv, &transferred, FALSE);
+                ok = WinUsb_GetOverlappedResult(hWinUsb, &ctx->winusbOv, &totalRead, FALSE);
                 ctx->readPending = false;
                 ResetEvent(ctx->hEvent);
             } else {
@@ -800,36 +1098,49 @@ static BOOL WINAPI Hook_ReadFile(HANDLE hFile, LPVOID buf, DWORD len, LPDWORD re
             }
         }
 
-        while (ok && transferred < readReq && readReq >= 512 && (transferred % 64) == 0) {
-            ULONG chunkGot = 0;
-            ResetEvent(ctx->hEvent);
-            memset(&ctx->winusbOv, 0, sizeof(OVERLAPPED));
-            ctx->winusbOv.hEvent = ctx->hEvent;
+        if (ok && totalRead > 0 && buf) {
+            DWORD firstCopy = (totalRead < len) ? totalRead : len;
+            memcpy(buf, ctx->readBuffer, firstCopy);
+            totalRead = firstCopy;
 
-            BOOL chunkOk = WinUsb_ReadPipe(hWinUsb, inPipe,
-                                           ctx->readBuffer + transferred,
-                                           readReq - transferred,
-                                           &chunkGot, &ctx->winusbOv);
-            if (!chunkOk && GetLastError() == ERROR_IO_PENDING) {
-                if (WaitForSingleObject(ctx->hEvent, 500) == WAIT_OBJECT_0) {
-                    chunkOk = WinUsb_GetOverlappedResult(hWinUsb, &ctx->winusbOv, &chunkGot, FALSE);
-                } else {
-                    WinUsb_AbortPipe(hWinUsb, inPipe);
-                    break;
+            PUCHAR pUserBytes = (PUCHAR)buf;
+            while (ok && totalRead < len && len >= 512 && (totalRead % 64) == 0) {
+                DWORD rem = len - totalRead;
+                ULONG chunkReq = (rem > 32768) ? 32768 : rem;
+                ULONG chunkGot = 0;
+
+                ResetEvent(ctx->hEvent);
+                memset(&ctx->winusbOv, 0, sizeof(OVERLAPPED));
+                ctx->winusbOv.hEvent = ctx->hEvent;
+
+                BOOL chunkOk = WinUsb_ReadPipe(hWinUsb, inPipe,
+                                               pUserBytes + totalRead,
+                                               chunkReq,
+                                               &chunkGot, &ctx->winusbOv);
+                if (!chunkOk && GetLastError() == ERROR_IO_PENDING) {
+                    if (WaitForSingleObject(ctx->hEvent, 1500) == WAIT_OBJECT_0) {
+                        chunkOk = WinUsb_GetOverlappedResult(hWinUsb, &ctx->winusbOv, &chunkGot, FALSE);
+                    } else {
+                        CancelIoEx(g_Units[uIdx].hUsbDevice, &ctx->winusbOv);
+                        break;
+                    }
                 }
+                if (!chunkOk || chunkGot == 0) break;
+                totalRead += chunkGot;
+                if ((chunkGot % 64) != 0) break;
             }
-            if (!chunkOk || chunkGot == 0) break;
-            transferred += chunkGot;
-            if ((chunkGot % 64) != 0) break;
         }
+    } else if (ok && totalRead > 0 && buf) {
+        DWORD copyLen = (len < totalRead) ? len : totalRead;
+        memcpy(buf, ctx->readBuffer, copyLen);
+        totalRead = copyLen;
     }
 
-    if (ok && transferred > 0) {
-        DWORD copyLen = (len < transferred) ? len : transferred;
-        memcpy(buf, ctx->readBuffer, copyLen);
-
-        if (readBytes) *readBytes = copyLen;
-        CompleteIoOperation(ov, copyLen, TRUE);
+    if (ok && totalRead > 0) {
+        ctx->lastBytesTransferred = totalRead;
+        ctx->lastResultOk = TRUE;
+        if (readBytes) *readBytes = totalRead;
+        CompleteIoOperation(ov, totalRead, TRUE);
 
         if (ov) {
             SetLastError(ERROR_IO_PENDING);
@@ -838,6 +1149,8 @@ static BOOL WINAPI Hook_ReadFile(HANDLE hFile, LPVOID buf, DWORD len, LPDWORD re
         return TRUE;
     }
 
+    ctx->lastBytesTransferred = 0;
+    ctx->lastResultOk = FALSE;
     if (readBytes) *readBytes = 0;
     if (ov) {
         SetLastError(ERROR_IO_PENDING);
@@ -855,7 +1168,7 @@ static BOOL WINAPI Hook_GetOverlappedResult(HANDLE hFile, LPOVERLAPPED ov, LPDWO
         WINUSB_INTERFACE_HANDLE hWinUsb = (uIdx >= 0 && uIdx < MAX_AKAI_UNITS) ? g_Units[uIdx].hWinUsb : NULL;
 
         if (idx >= 0 && g_Handles[idx].readPending && g_Handles[idx].hEvent && hWinUsb) {
-            DWORD waitTime = wait ? 4000 : 0;
+            DWORD waitTime = wait ? 15000 : 0;
             DWORD waitRes = WaitForSingleObject(g_Handles[idx].hEvent, waitTime);
             if (waitRes == WAIT_OBJECT_0) {
                 ULONG got = 0;
@@ -878,8 +1191,8 @@ static BOOL WINAPI Hook_GetOverlappedResult(HANDLE hFile, LPOVERLAPPED ov, LPDWO
             return FALSE;
         }
 
-        DWORD bytes = ov ? (DWORD)ov->InternalHigh : g_LastBytesTransferred;
-        BOOL ok = (ov == NULL) || (ov->Internal == STATUS_SUCCESS);
+        DWORD bytes = ov ? (DWORD)ov->InternalHigh : ((idx >= 0) ? g_Handles[idx].lastBytesTransferred : g_LastBytesTransferred);
+        BOOL ok = (ov == NULL) ? ((idx >= 0) ? g_Handles[idx].lastResultOk : TRUE) : (ov->Internal == STATUS_SUCCESS);
         if (trans) *trans = bytes;
         SetLastError(ok ? ERROR_SUCCESS : ERROR_GEN_FAILURE);
         return ok;
@@ -897,21 +1210,21 @@ static BOOL WINAPI Hook_DeviceIoControl(HANDLE hDev, DWORD code, LPVOID inBuf, D
     UCHAR inPipe = (uIdx >= 0 && uIdx < MAX_AKAI_UNITS && g_Units[uIdx].active) ? g_Units[uIdx].bulkInPipe : 0x82;
     UCHAR outPipe = (uIdx >= 0 && uIdx < MAX_AKAI_UNITS && g_Units[uIdx].active) ? g_Units[uIdx].bulkOutPipe : 0x02;
 
-    // Handle WDM USB Bulk/Reset/Abort IOCTLs used across S56Device.dll, Z48Device.dll, and MPC4K
     if (code == 0x00220008 || code == 0x00220000 || code == 0x00220004 ||
         code == 0x0022000C || code == 0x00220010 || code == 0x00220014) {
         if (idx >= 0 && g_Handles[idx].type == HANDLE_TYPE_PIPE0 && hWinUsb) {
             g_Handles[idx].readPending = false;
             WinUsb_AbortPipe(hWinUsb, inPipe);
         }
-        if (outBuf && outSz > 0) {
-            memset(outBuf, 0, outSz);
+        if (outBuf && outSz > 0) memset(outBuf, 0, outSz);
+        if (idx >= 0) {
+            g_Handles[idx].lastBytesTransferred = outSz;
+            g_Handles[idx].lastResultOk = TRUE;
         }
-        if (ret) *ret = 0;
-        return CompleteIoOperation(ov, 0, TRUE);
+        if (ret) *ret = outSz;
+        return CompleteIoOperation(ov, outSz, TRUE);
     }
 
-    // Support direct bulk write / read via IOCTL if a Z48/MPC4000 helper issues bulk transfer IOCTLs
     if (hWinUsb && inBuf && inSz > 0 && (!outBuf || outSz == 0)) {
         ULONG transferred = 0;
         OVERLAPPED localOv;
@@ -922,15 +1235,21 @@ static BOOL WINAPI Hook_DeviceIoControl(HANDLE hDev, DWORD code, LPVOID inBuf, D
             ok = WinUsb_GetOverlappedResult(hWinUsb, &localOv, &transferred, TRUE);
         }
         CloseHandle(localOv.hEvent);
+        if (idx >= 0) {
+            g_Handles[idx].lastBytesTransferred = transferred;
+            g_Handles[idx].lastResultOk = ok;
+        }
         if (ret) *ret = transferred;
         return CompleteIoOperation(ov, transferred, ok);
     }
 
-    if (outBuf && outSz > 0) {
-        memset(outBuf, 0, outSz);
+    if (outBuf && outSz > 0) memset(outBuf, 0, outSz);
+    if (idx >= 0) {
+        g_Handles[idx].lastBytesTransferred = outSz;
+        g_Handles[idx].lastResultOk = TRUE;
     }
-    if (ret) *ret = 0;
-    return CompleteIoOperation(ov, 0, TRUE);
+    if (ret) *ret = outSz;
+    return CompleteIoOperation(ov, outSz, TRUE);
 }
 
 static BOOL WINAPI Hook_CancelIo(HANDLE hFile) {
@@ -950,17 +1269,6 @@ static BOOL WINAPI Hook_CancelIo(HANDLE hFile) {
     return CancelIo(hFile);
 }
 
-static BOOL WINAPI Hook_CloseHandle(HANDLE hObject) {
-    if (IsAkaiHandle(hObject)) {
-        FreeAkaiHandle(hObject);
-        return TRUE;
-    }
-    return CloseHandle(hObject);
-}
-
-// ----------------------------------------------------------------------------
-// v15.0 HD Theme Upscaler (S5000, S6000, Z4, Z8, MPC4000 Panels & Editors)
-// ----------------------------------------------------------------------------
 #define MAX_SCALED_WINDOWS 256
 #define WM_AKAI_APPLY_ZOOM   (WM_APP + 0x414B)
 
@@ -992,12 +1300,6 @@ struct ScaledSubWindow {
     DWORD* pBackPixels;
     int backW;
     int backH;
-    // High-Res Upscaled Output Buffer for CAS + Halftone Scaling
-    HDC hUpscaledDC;
-    HBITMAP hUpscaledBmp;
-    DWORD* pUpscaledPixels;
-    int upscaledW;
-    int upscaledH;
     bool initialized;
 };
 
@@ -1027,9 +1329,7 @@ static ScaledSubWindow* FindByCanvasOrFrame(HWND hwnd) {
         }
     }
     HWND hParent = GetParent(hwnd);
-    if (hParent) {
-        return FindByFrame(hParent);
-    }
+    if (hParent) return FindByFrame(hParent);
     return NULL;
 }
 
@@ -1086,103 +1386,6 @@ static void EnsureBackbuffer(ScaledSubWindow* sw, HDC hdcRef) {
     sw->cropH = sw->baseCanvasH;
 }
 
-static void EnsureUpscaledBuffer(ScaledSubWindow* sw, HDC hdcRef, int dstW, int dstH) {
-    if (!sw || dstW <= 10 || dstH <= 10) return;
-    if (sw->hUpscaledDC && sw->hUpscaledBmp && sw->pUpscaledPixels &&
-        sw->upscaledW == dstW && sw->upscaledH == dstH) {
-        return;
-    }
-
-    BITMAPINFO bmi;
-    memset(&bmi, 0, sizeof(bmi));
-    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-    bmi.bmiHeader.biWidth = dstW;
-    bmi.bmiHeader.biHeight = -dstH;
-    bmi.bmiHeader.biPlanes = 1;
-    bmi.bmiHeader.biBitCount = 32;
-    bmi.bmiHeader.biCompression = BI_RGB;
-
-    void* pBits = NULL;
-    HDC hNewDC = CreateCompatibleDC(hdcRef);
-    HBITMAP hNewBmp = CreateDIBSection(hdcRef, &bmi, DIB_RGB_COLORS, &pBits, NULL, 0);
-    if (hNewBmp && pBits) {
-        SelectObject(hNewDC, hNewBmp);
-    }
-
-    if (sw->hUpscaledBmp) DeleteObject(sw->hUpscaledBmp);
-    if (sw->hUpscaledDC) DeleteDC(sw->hUpscaledDC);
-
-    sw->hUpscaledDC = hNewDC;
-    sw->hUpscaledBmp = hNewBmp;
-    sw->pUpscaledPixels = (DWORD*)pBits;
-    sw->upscaledW = dstW;
-    sw->upscaledH = dstH;
-}
-
-static inline int ClampByte(int v) {
-    return (v < 0) ? 0 : ((v > 255) ? 255 : v);
-}
-
-static void RenderHighResUpscaledSurface(ScaledSubWindow* sw, HDC hdcDest) {
-    if (!sw || !sw->hBackDC || !sw->pBackPixels) return;
-    int srcW = GetEffectiveSourceW(sw);
-    int srcH = GetEffectiveSourceH(sw);
-    int dstW = sw->curCanvasW;
-    int dstH = sw->curCanvasH;
-
-    if (dstW <= 10 || dstH <= 10 || srcW <= 10 || srcH <= 10) return;
-
-    if (!g_EnableHdSharpening || (abs(dstW - srcW) <= 2 && abs(dstH - srcH) <= 2)) {
-        SelectClipRgn(hdcDest, NULL);
-        int oldMode = SetStretchBltMode(hdcDest, HALFTONE);
-        SetBrushOrgEx(hdcDest, 0, 0, NULL);
-        StretchBlt(hdcDest, 0, 0, dstW, dstH, sw->hBackDC, 0, 0, srcW, srcH, SRCCOPY);
-        SetStretchBltMode(hdcDest, oldMode);
-        return;
-    }
-
-    EnsureUpscaledBuffer(sw, hdcDest, dstW, dstH);
-    if (!sw->hUpscaledDC || !sw->pUpscaledPixels) {
-        StretchBlt(hdcDest, 0, 0, dstW, dstH, sw->hBackDC, 0, 0, srcW, srcH, SRCCOPY);
-        return;
-    }
-
-    int oldMode = SetStretchBltMode(sw->hUpscaledDC, HALFTONE);
-    SetBrushOrgEx(sw->hUpscaledDC, 0, 0, NULL);
-    StretchBlt(sw->hUpscaledDC, 0, 0, dstW, dstH, sw->hBackDC, 0, 0, srcW, srcH, SRCCOPY);
-    SetStretchBltMode(sw->hUpscaledDC, oldMode);
-    GdiFlush();
-
-    DWORD* px = sw->pUpscaledPixels;
-    for (int y = 1; y < dstH - 1; y++) {
-        DWORD* rowPrev = px + (y - 1) * dstW;
-        DWORD* rowCur  = px + y * dstW;
-        DWORD* rowNext = px + (y + 1) * dstW;
-
-        for (int x = 1; x < dstW - 1; x++) {
-            DWORD c  = rowCur[x];
-            DWORD l  = rowCur[x - 1];
-            DWORD r  = rowCur[x + 1];
-            DWORD u  = rowPrev[x];
-            DWORD d  = rowNext[x];
-
-            int cR = (c >> 16) & 0xFF, cG = (c >> 8) & 0xFF, cB = c & 0xFF;
-            int avgR = (((l >> 16) & 0xFF) + ((r >> 16) & 0xFF) + ((u >> 16) & 0xFF) + ((d >> 16) & 0xFF)) >> 2;
-            int avgG = (((l >> 8) & 0xFF)  + ((r >> 8) & 0xFF)  + ((u >> 8) & 0xFF)  + ((d >> 8) & 0xFF)) >> 2;
-            int avgB = ((l & 0xFF)         + (r & 0xFF)         + (u & 0xFF)         + (d & 0xFF)) >> 2;
-
-            int outR = ClampByte(cR + ((cR - avgR) * 90 >> 8));
-            int outG = ClampByte(cG + ((cG - avgG) * 90 >> 8));
-            int outB = ClampByte(cB + ((cB - avgB) * 90 >> 8));
-
-            rowCur[x] = (DWORD)((outR << 16) | (outG << 8) | outB);
-        }
-    }
-
-    SelectClipRgn(hdcDest, NULL);
-    BitBlt(hdcDest, 0, 0, dstW, dstH, sw->hUpscaledDC, 0, 0, SRCCOPY);
-}
-
 static void ProcessBackbufferPixels(ScaledSubWindow* sw) {
     if (!sw || !sw->pBackPixels || sw->backW <= 10 || sw->backH <= 10) return;
     GdiFlush();
@@ -1198,7 +1401,6 @@ static void ProcessBackbufferPixels(ScaledSubWindow* sw) {
     }
 
     if (sw->isRemotePanel) {
-        // Replace hot-magenta chromakey corner pixels on S5000/S6000/Z4/Z8/MPC4000 remote panels
         const DWORD bezelColor = sw->isZ48OrMpcRemote ? 0x002B3842 : 0x00315163;
         for (int i = 0; i < W * H; i++) {
             DWORD c = px[i];
@@ -1215,7 +1417,6 @@ static void ProcessBackbufferPixels(ScaledSubWindow* sw) {
     }
 
     sw->cropW = W;
-
     if (sw->isEb20Window) {
         sw->cropH = H;
         return;
@@ -1282,12 +1483,8 @@ static void UpdateWindowRegionsForScale(ScaledSubWindow* sw) {
             SetWindowRgn(sw->hwnd, hFrameRgn, TRUE);
         }
     } else {
-        if (sw->hwnd && IsWindow(sw->hwnd)) {
-            SetWindowRgn(sw->hwnd, NULL, FALSE);
-        }
-        if (sw->hwndCanvas && IsWindow(sw->hwndCanvas)) {
-            SetWindowRgn(sw->hwndCanvas, NULL, FALSE);
-        }
+        if (sw->hwnd && IsWindow(sw->hwnd)) SetWindowRgn(sw->hwnd, NULL, FALSE);
+        if (sw->hwndCanvas && IsWindow(sw->hwndCanvas)) SetWindowRgn(sw->hwndCanvas, NULL, FALSE);
     }
 }
 
@@ -1316,9 +1513,7 @@ static int WINAPI Hook_SetWindowRgn(HWND hWnd, HRGN hRgn, BOOL bRedraw) {
 static BOOL WINAPI Hook_InvalidateRect(HWND hWnd, const RECT* lpRect, BOOL bErase) {
     if (hWnd && lpRect != NULL) {
         ScaledSubWindow* sw = FindByCanvasOrFrame(hWnd);
-        if (sw) {
-            return InvalidateRect(hWnd, NULL, FALSE);
-        }
+        if (sw) return InvalidateRect(hWnd, NULL, FALSE);
     }
     return InvalidateRect(hWnd, lpRect, bErase);
 }
@@ -1346,7 +1541,6 @@ static BOOL WINAPI Hook_BitBlt(HDC hdcDest, int xDest, int yDest, int wDest, int
             if (sw && sw->baseCanvasW > 10 && sw->baseCanvasH > 10 &&
                 sw->curCanvasW > 10 && sw->curCanvasH > 10) {
 
-                // Auto-expand backbuffer if Z4/Z8/MPC4000 editor blits a larger rack surface than initial window size
                 if (xDest == 0 && yDest == 0 && wDest > sw->baseCanvasW && wDest <= 2400) {
                     sw->baseCanvasW = wDest;
                 }
@@ -1386,7 +1580,11 @@ static BOOL WINAPI Hook_BitBlt(HDC hdcDest, int xDest, int yDest, int wDest, int
                 int srcH = GetEffectiveSourceH(sw);
 
                 if (abs(sw->curCanvasW - srcW) > 1 || abs(sw->curCanvasH - srcH) > 1 || sw->isRemotePanel || sw->isDropdownPopup) {
-                    RenderHighResUpscaledSurface(sw, hdcDest);
+                    SelectClipRgn(hdcDest, NULL);
+                    int oldMode = SetStretchBltMode(hdcDest, HALFTONE);
+                    SetBrushOrgEx(hdcDest, 0, 0, NULL);
+                    StretchBlt(hdcDest, 0, 0, sw->curCanvasW, sw->curCanvasH, sw->hBackDC, 0, 0, srcW, srcH, SRCCOPY);
+                    SetStretchBltMode(hdcDest, oldMode);
                     return TRUE;
                 }
             }
@@ -1423,9 +1621,7 @@ static BOOL WINAPI Hook_ClientToScreen(HWND hWnd, LPPOINT lpPoint) {
                 scaledPt.x = (LONG)((double)lpPoint->x * (double)sw->curCanvasW / (double)srcW + 0.5);
                 scaledPt.y = (LONG)((double)lpPoint->y * (double)sw->curCanvasH / (double)srcH + 0.5);
                 BOOL ok = ClientToScreen(hWnd, &scaledPt);
-                if (ok) {
-                    *lpPoint = scaledPt;
-                }
+                if (ok) *lpPoint = scaledPt;
                 return ok;
             }
         }
@@ -1434,14 +1630,10 @@ static BOOL WINAPI Hook_ClientToScreen(HWND hWnd, LPPOINT lpPoint) {
 }
 
 static LPARAM ScaleMouseLParam(ScaledSubWindow* sw, LPARAM lParam) {
-    if (!sw || sw->curCanvasW <= 10 || sw->curCanvasH <= 10) {
-        return lParam;
-    }
+    if (!sw || sw->curCanvasW <= 10 || sw->curCanvasH <= 10) return lParam;
     int srcW = GetEffectiveSourceW(sw);
     int srcH = GetEffectiveSourceH(sw);
-    if (abs(sw->curCanvasW - srcW) <= 1 && abs(sw->curCanvasH - srcH) <= 1) {
-        return lParam;
-    }
+    if (abs(sw->curCanvasW - srcW) <= 1 && abs(sw->curCanvasH - srcH) <= 1) return lParam;
     short curX = (short)LOWORD(lParam);
     short curY = (short)HIWORD(lParam);
     short mappedX = (short)((double)curX * (double)srcW / (double)sw->curCanvasW + 0.5);
@@ -1454,14 +1646,17 @@ static void RepaintFromBackbuffer(ScaledSubWindow* sw) {
     ProcessBackbufferPixels(sw);
     HDC hdc = GetDC(sw->hwndCanvas);
     if (hdc) {
-        RenderHighResUpscaledSurface(sw, hdc);
+        int srcW = GetEffectiveSourceW(sw);
+        int srcH = GetEffectiveSourceH(sw);
+        SelectClipRgn(hdc, NULL);
+        int oldMode = SetStretchBltMode(hdc, HALFTONE);
+        SetBrushOrgEx(hdc, 0, 0, NULL);
+        StretchBlt(hdc, 0, 0, sw->curCanvasW, sw->curCanvasH, sw->hBackDC, 0, 0, srcW, srcH, SRCCOPY);
+        SetStretchBltMode(hdc, oldMode);
         ReleaseDC(sw->hwndCanvas, hdc);
     }
 }
 
-// ----------------------------------------------------------------------------
-// Owner-Drawn Menu Scaling (WM_MEASUREITEM & WM_DRAWITEM for MIDI 1A..16B, etc.)
-// ----------------------------------------------------------------------------
 static LRESULT HandleScaledMeasureItem(ScaledSubWindow* sw, HWND hwnd, WNDPROC origProc, WPARAM wParam, LPARAM lParam) {
     LRESULT res = CallWindowProcA(origProc, hwnd, WM_MEASUREITEM, wParam, lParam);
     LPMEASUREITEMSTRUCT lpmis = (LPMEASUREITEMSTRUCT)lParam;
@@ -1477,9 +1672,7 @@ static LRESULT HandleScaledMeasureItem(ScaledSubWindow* sw, HWND hwnd, WNDPROC o
             int screenH = GetSystemMetrics(SM_CYSCREEN);
             UINT maxItemH = (UINT)((screenH - 96) / 33);
             if (maxItemH < origH) maxItemH = origH;
-            if (newH > maxItemH) {
-                newH = maxItemH;
-            }
+            if (newH > maxItemH) newH = maxItemH;
 
             lpmis->itemWidth = newW;
             lpmis->itemHeight = newH;
@@ -1507,9 +1700,7 @@ static LRESULT HandleScaledDrawItem(ScaledSubWindow* sw, HWND hwnd, WNDPROC orig
     int srcH = (int)((double)dstH / z + 0.5);
     if (srcW < 16) srcW = 16;
     if (srcH < 11) srcH = 11;
-    if (srcH > 16 && dstH <= (int)(16.0 * z + 2.0)) {
-        srcH = 14;
-    }
+    if (srcH > 16 && dstH <= (int)(16.0 * z + 2.0)) srcH = 14;
 
     HDC hMemDC = CreateCompatibleDC(lpdis->hDC);
     HBITMAP hMemBmp = CreateCompatibleBitmap(lpdis->hDC, srcW, srcH);
@@ -1610,12 +1801,8 @@ static LRESULT CALLBACK CanvasScaleWndProc(HWND hwnd, UINT msg, WPARAM wParam, L
     WNDPROC origProc = sw->origCanvasProc;
 
     switch (msg) {
-        case WM_MEASUREITEM: {
-            return HandleScaledMeasureItem(sw, hwnd, origProc, wParam, lParam);
-        }
-        case WM_DRAWITEM: {
-            return HandleScaledDrawItem(sw, hwnd, origProc, wParam, lParam);
-        }
+        case WM_MEASUREITEM: return HandleScaledMeasureItem(sw, hwnd, origProc, wParam, lParam);
+        case WM_DRAWITEM:    return HandleScaledDrawItem(sw, hwnd, origProc, wParam, lParam);
         case WM_WINDOWPOSCHANGING: {
             WINDOWPOS* wp = (WINDOWPOS*)lParam;
             if (wp && !(wp->flags & SWP_NOSIZE) && !sw->inZoomResize && !sw->isRemotePanel) {
@@ -1624,9 +1811,7 @@ static LRESULT CALLBACK CanvasScaleWndProc(HWND hwnd, UINT msg, WPARAM wParam, L
                         RECT rcClear = { 0, wp->cy, sw->baseCanvasW, sw->baseCanvasH };
                         FillRect(sw->hBackDC, &rcClear, (HBRUSH)GetStockObject(BLACK_BRUSH));
                     }
-                    if (wp->cy > sw->baseCanvasH) {
-                        sw->baseCanvasH = wp->cy;
-                    }
+                    if (wp->cy > sw->baseCanvasH) sw->baseCanvasH = wp->cy;
                     sw->cropH = wp->cy;
                     wp->cx = (int)(sw->baseCanvasW * sw->currentZoom + 0.5);
                     wp->cy = (int)(sw->cropH * sw->currentZoom + 0.5);
@@ -1655,9 +1840,7 @@ static LRESULT CALLBACK CanvasScaleWndProc(HWND hwnd, UINT msg, WPARAM wParam, L
             StripScrollBars(hwnd);
             InvalidateRect(hwnd, NULL, FALSE);
             LRESULT res = CallWindowProcA(origProc, hwnd, msg, wParam, lParam);
-            if (sw->hBackDC) {
-                RepaintFromBackbuffer(sw);
-            }
+            if (sw->hBackDC) RepaintFromBackbuffer(sw);
             return res;
         }
         case WM_LBUTTONDOWN:
@@ -1689,17 +1872,11 @@ static LRESULT CALLBACK FrameScaleWndProc(HWND hwnd, UINT msg, WPARAM wParam, LP
     WNDPROC origProc = sw->origFrameProc;
 
     switch (msg) {
-        case WM_MEASUREITEM: {
-            return HandleScaledMeasureItem(sw, hwnd, origProc, wParam, lParam);
-        }
-        case WM_DRAWITEM: {
-            return HandleScaledDrawItem(sw, hwnd, origProc, wParam, lParam);
-        }
+        case WM_MEASUREITEM: return HandleScaledMeasureItem(sw, hwnd, origProc, wParam, lParam);
+        case WM_DRAWITEM:    return HandleScaledDrawItem(sw, hwnd, origProc, wParam, lParam);
         case WM_AKAI_APPLY_ZOOM: {
             double z = (double)wParam / 100.0;
-            if (z >= 0.5 && z <= 4.0) {
-                PerformMainThreadZoom(sw, z);
-            }
+            if (z >= 0.5 && z <= 4.0) PerformMainThreadZoom(sw, z);
             return 0;
         }
         case WM_WINDOWPOSCHANGING: {
@@ -1712,9 +1889,7 @@ static LRESULT CALLBACK FrameScaleWndProc(HWND hwnd, UINT msg, WPARAM wParam, LP
                         RECT rcClear = { 0, reqClientH, sw->baseCanvasW, sw->baseCanvasH };
                         FillRect(sw->hBackDC, &rcClear, (HBRUSH)GetStockObject(BLACK_BRUSH));
                     }
-                    if (reqClientH > sw->baseCanvasH) {
-                        sw->baseCanvasH = reqClientH;
-                    }
+                    if (reqClientH > sw->baseCanvasH) sw->baseCanvasH = reqClientH;
                     sw->cropH = reqClientH;
                     wp->cx = (int)(sw->baseCanvasW * sw->currentZoom + 0.5) + sw->frameNonClientW;
                     wp->cy = (int)(sw->cropH * sw->currentZoom + 0.5) + sw->frameNonClientH;
@@ -1777,9 +1952,7 @@ static LRESULT CALLBACK FrameScaleWndProc(HWND hwnd, UINT msg, WPARAM wParam, LP
                     sw->curCanvasW = cW;
                     sw->curCanvasH = cH;
                     int srcW = GetEffectiveSourceW(sw);
-                    if (srcW > 50) {
-                        sw->currentZoom = (double)cW / (double)srcW;
-                    }
+                    if (srcW > 50) sw->currentZoom = (double)cW / (double)srcW;
                     if (sw->hwndCanvas && IsWindow(sw->hwndCanvas)) {
                         sw->inZoomResize = true;
                         StripScrollBars(sw->hwndCanvas);
@@ -1817,16 +1990,7 @@ static LRESULT CALLBACK FrameScaleWndProc(HWND hwnd, UINT msg, WPARAM wParam, LP
                 DeleteDC(sw->hBackDC);
                 sw->hBackDC = NULL;
             }
-            if (sw->hUpscaledBmp) {
-                DeleteObject(sw->hUpscaledBmp);
-                sw->hUpscaledBmp = NULL;
-            }
-            if (sw->hUpscaledDC) {
-                DeleteDC(sw->hUpscaledDC);
-                sw->hUpscaledDC = NULL;
-            }
             sw->pBackPixels = NULL;
-            sw->pUpscaledPixels = NULL;
             sw->hwnd = NULL;
             sw->initialized = false;
             return CallWindowProcA(origProc, hwnd, msg, wParam, lParam);
@@ -1840,6 +2004,19 @@ struct EnumScaleCtx {
     bool forceApplyZoom;
 };
 
+static void EnsureWritableWorkingDirectoryAndDragDropFilters() {
+    HMODULE hUser32 = GetModuleHandleA("user32.dll");
+    if (hUser32) {
+        typedef BOOL (WINAPI *PFN_ChangeWindowMessageFilter)(UINT, DWORD);
+        PFN_ChangeWindowMessageFilter pfnFilter = (PFN_ChangeWindowMessageFilter)GetProcAddress(hUser32, "ChangeWindowMessageFilter");
+        if (pfnFilter) {
+            pfnFilter(0x0233 /* WM_DROPFILES */, 1);
+            pfnFilter(0x0049 /* WM_COPYGLOBALDATA */, 1);
+            pfnFilter(0x004A /* WM_COPYDATA */, 1);
+        }
+    }
+}
+
 static void RegisterAfxFrameWindow(HWND hwnd, double currentZoom, bool forceApplyZoom) {
     if (!IsWindow(hwnd) || !IsWindowVisible(hwnd)) return;
 
@@ -1848,9 +2025,7 @@ static void RegisterAfxFrameWindow(HWND hwnd, double currentZoom, bool forceAppl
     GetClassNameA(hwnd, clsName, sizeof(clsName) - 1);
     GetWindowTextA(hwnd, title, sizeof(title) - 1);
 
-    if (strstr(clsName, "AfxFrameOrView") == NULL || title[0] == '\0') {
-        return;
-    }
+    if (strstr(clsName, "AfxFrameOrView") == NULL || title[0] == '\0') return;
 
     ScaledSubWindow* existing = FindByFrame(hwnd);
     if (existing) {
@@ -1875,23 +2050,16 @@ static void RegisterAfxFrameWindow(HWND hwnd, double currentZoom, bool forceAppl
     strncpy(lowerTitle, title, sizeof(lowerTitle) - 1);
     _strlwr(lowerTitle);
 
-    // Identify S5000, S6000, Z4, Z8, and MPC4000 Remote Panels
     bool isS56Remote = (strcmp(title, "AKAI S6000") == 0 || strcmp(title, "AKAI S5000") == 0);
     bool isZ48OrMpcRemote = (!isS56Remote &&
                              (strcmp(title, "AKAI Z4") == 0 || strcmp(title, "AKAI Z8") == 0 ||
                               strcmp(title, "AKAI MPC4000") == 0 || strcmp(title, "MPC4000") == 0 ||
                               strstr(lowerTitle, "remote") != NULL || strstr(lowerTitle, "panel") != NULL));
     bool isRemote = (isS56Remote || isZ48OrMpcRemote);
-
-    // Identify Effects / EB20 / 4-Channel FX Windows (S56 EB20 or Z4/Z8/MPC4000 FX)
     bool isEb20 = (!isRemote && (strstr(lowerTitle, "eb20") != NULL || strstr(lowerTitle, "effect") != NULL ||
                                  strstr(lowerTitle, "fx") != NULL || strstr(lowerTitle, "reverb") != NULL));
-
-    // Identify Multi / Mixer / Song / Sequence Windows
     bool isMulti = (!isRemote && !isEb20 &&
                     (strstr(lowerTitle, "multi") != NULL || strstr(lowerTitle, "mix") != NULL || winW > 1000));
-
-    // Identify Program Editor Windows (S56, Z4, Z8, MPC4000 Keygroup / Drum Programs)
     bool isProg = (!isRemote && !isEb20 && !isMulti);
 
     HWND hCanvas = NULL;
@@ -1899,16 +2067,13 @@ static void RegisterAfxFrameWindow(HWND hwnd, double currentZoom, bool forceAppl
     while (hChild) {
         char cCls[64] = {0};
         GetClassNameA(hChild, cCls, sizeof(cCls) - 1);
-        if (strstr(cCls, "Afx:") && !hCanvas) {
-            hCanvas = hChild;
-        }
+        if (strstr(cCls, "Afx:") && !hCanvas) hCanvas = hChild;
         hChild = GetWindow(hChild, GW_HWNDNEXT);
     }
 
     int nonClientW = (winW > clientW) ? (winW - clientW) : 16;
     int nonClientH = (winH > clientH) ? (winH - clientH) : 39;
 
-    // Determine native 1.0x canvas dimensions dynamically so both S56 and Z48/MPC4000 layouts fit cleanly
     int trueBaseW = clientW;
     int trueBaseH = clientH;
     if (isS56Remote) {
@@ -1924,7 +2089,6 @@ static void RegisterAfxFrameWindow(HWND hwnd, double currentZoom, bool forceAppl
         trueBaseW = (clientW > 200) ? clientW : 650;
         trueBaseH = (clientH > 150) ? clientH : 352;
     } else {
-        // S56 Program Editor is 766x546; Z4/Z8/MPC4000 Program Editor uses its native width or 766x546
         trueBaseW = (clientW > 400 && abs(clientW - 766) > 32) ? clientW : 766;
         trueBaseH = (clientH > 546) ? clientH : 546;
     }
@@ -1965,17 +2129,11 @@ static void RegisterAfxFrameWindow(HWND hwnd, double currentZoom, bool forceAppl
     sw->pBackPixels = NULL;
     sw->backW = 0;
     sw->backH = 0;
-    sw->hUpscaledDC = NULL;
-    sw->hUpscaledBmp = NULL;
-    sw->pUpscaledPixels = NULL;
-    sw->upscaledW = 0;
-    sw->upscaledH = 0;
     sw->initialized = true;
     g_LastClickedEditor = sw;
 
     if (hCanvas) {
         StripScrollBars(hCanvas);
-
         HDC hdcWin = GetDC(hCanvas);
         if (hdcWin) {
             EnsureBackbuffer(sw, hdcWin);
@@ -1992,6 +2150,22 @@ static void RegisterAfxFrameWindow(HWND hwnd, double currentZoom, bool forceAppl
         SetWindowLongA(hwnd, GWL_STYLE, style | WS_THICKFRAME);
     } else {
         SetWindowLongA(hwnd, GWL_STYLE, style | WS_THICKFRAME | WS_MAXIMIZEBOX | WS_MINIMIZEBOX);
+    }
+
+    HMODULE hUser32 = GetModuleHandleA("user32.dll");
+    if (hUser32) {
+        typedef BOOL (WINAPI *PFN_ChangeWindowMessageFilterEx)(HWND, UINT, DWORD, PVOID);
+        PFN_ChangeWindowMessageFilterEx pfnEx = (PFN_ChangeWindowMessageFilterEx)GetProcAddress(hUser32, "ChangeWindowMessageFilterEx");
+        if (pfnEx) {
+            pfnEx(hwnd, 0x0233 /* WM_DROPFILES */, 1, NULL);
+            pfnEx(hwnd, 0x0049 /* WM_COPYGLOBALDATA */, 1, NULL);
+            pfnEx(hwnd, 0x004A /* WM_COPYDATA */, 1, NULL);
+            if (hCanvas) {
+                pfnEx(hCanvas, 0x0233, 1, NULL);
+                pfnEx(hCanvas, 0x0049, 1, NULL);
+                pfnEx(hCanvas, 0x004A, 1, NULL);
+            }
+        }
     }
 
     sw->origFrameProc = (WNDPROC)SetWindowLongPtrA(hwnd, GWLP_WNDPROC, (LONG_PTR)FrameScaleWndProc);
@@ -2029,16 +2203,12 @@ static void ScanAndScaleAllSubWindows(double requestedZoom, bool forceApplyZoom)
     EnumWindows(EnumTopWindowsProc, (LPARAM)&ctx);
 }
 
-// ----------------------------------------------------------------------------
-// Dedicated UI Thread for Zoom Toolbar (with HD Theme Sharpening Toggle)
-// ----------------------------------------------------------------------------
 #define ID_BTN_ZOOM_100 9001
 #define ID_BTN_ZOOM_125 9002
 #define ID_BTN_ZOOM_150 9003
 #define ID_BTN_ZOOM_175 9004
 #define ID_BTN_ZOOM_200 9005
 #define ID_CHK_ASPECT   9006
-#define ID_CHK_HDSHARP  9007
 
 static LRESULT CALLBACK ZoomToolbarWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
@@ -2054,12 +2224,6 @@ static LRESULT CALLBACK ZoomToolbarWndProc(HWND hwnd, UINT msg, WPARAM wParam, L
                 if (g_KeepAspectRatio) {
                     ScanAndScaleAllSubWindows(g_CurrentGlobalZoom, true);
                 }
-                return 0;
-            }
-            if (wmId == ID_CHK_HDSHARP) {
-                LRESULT chk = SendMessageA((HWND)lParam, BM_GETCHECK, 0, 0);
-                g_EnableHdSharpening = (chk == BST_CHECKED);
-                ScanAndScaleAllSubWindows(g_CurrentGlobalZoom, true);
                 return 0;
             }
 
@@ -2112,9 +2276,9 @@ static DWORD WINAPI ZoomToolbarUIThread(LPVOID) {
 
     g_hToolbarWidget = CreateWindowExA(WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
                                        "AkaiZoomBarClassV150",
-                                       "ak.sys S5000/S6000/Z4/Z8/MPC4000 HD Zoom (v15.0)",
+                                       "ak.sys S5000/S6000/Z4/Z8/MPC4000 Zoom (v15.0)",
                                        WS_POPUP | WS_CAPTION | WS_VISIBLE | WS_BORDER | WS_SYSMENU,
-                                       140, 90, 410, 126,
+                                       140, 90, 410, 106,
                                        NULL, NULL, GetModuleHandleA(NULL), NULL);
     if (!g_hToolbarWidget) return 0;
 
@@ -2153,18 +2317,6 @@ static DWORD WINAPI ZoomToolbarUIThread(LPVOID) {
         UpdateWindow(hChk);
     }
 
-    HWND hChkSharp = CreateWindowExA(0, "BUTTON", "Enable HD Theme Contrast-Adaptive Sharpening (CAS)",
-                                     WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX | WS_TABSTOP,
-                                     12, 64, 380, 20,
-                                     g_hToolbarWidget, (HMENU)(INT_PTR)ID_CHK_HDSHARP,
-                                     GetModuleHandleA(NULL), NULL);
-    if (hChkSharp) {
-        if (hFont) SendMessageA(hChkSharp, WM_SETFONT, (WPARAM)hFont, TRUE);
-        SendMessageA(hChkSharp, BM_SETCHECK, g_EnableHdSharpening ? BST_CHECKED : BST_UNCHECKED, 0);
-        ShowWindow(hChkSharp, SW_SHOW);
-        UpdateWindow(hChkSharp);
-    }
-
     ShowWindow(g_hToolbarWidget, SW_SHOW);
     UpdateWindow(g_hToolbarWidget);
 
@@ -2184,11 +2336,14 @@ static void EnsureZoomToolbarRunning() {
     if (hThread) CloseHandle(hThread);
 }
 
-// ----------------------------------------------------------------------------
-// Universal IAT Hook Engine (Covers S56Device, Z48Device, MPC4000, & all DLLs)
-// ----------------------------------------------------------------------------
 static void* ResolveHookFunction(const char* fn) {
+    if (strcmp(fn, "DoDragDrop") == 0) return (void*)Hook_DoDragDrop;
     if (strcmp(fn, "CreateFileA") == 0) return (void*)Hook_CreateFileA;
+    if (strcmp(fn, "CreateFileW") == 0) return (void*)Hook_CreateFileW;
+    if (strcmp(fn, "MoveFileA") == 0) return (void*)Hook_MoveFileA;
+    if (strcmp(fn, "MoveFileW") == 0) return (void*)Hook_MoveFileW;
+    if (strcmp(fn, "CopyFileA") == 0) return (void*)Hook_CopyFileA;
+    if (strcmp(fn, "CopyFileW") == 0) return (void*)Hook_CopyFileW;
     if (strcmp(fn, "ReadFile") == 0) return (void*)Hook_ReadFile;
     if (strcmp(fn, "WriteFile") == 0) return (void*)Hook_WriteFile;
     if (strcmp(fn, "DeviceIoControl") == 0) return (void*)Hook_DeviceIoControl;
@@ -2274,12 +2429,9 @@ static void ScanAndPatchAllLoadedModules() {
     };
     for (int i = 0; i < (int)(sizeof(knownModules) / sizeof(knownModules[0])); i++) {
         HMODULE h = GetModuleHandleA(knownModules[i]);
-        if (h) {
-            PatchModuleIAT(h, knownModules[i]);
-        }
+        if (h) PatchModuleIAT(h, knownModules[i]);
     }
 
-    // Dynamically enumerate all DLLs inside the aksys\devices folder so any Z4/Z8/MPC4000 plugin DLL is hooked
     char exePath[MAX_PATH] = {0};
     if (GetModuleFileNameA(NULL, exePath, MAX_PATH - 1)) {
         char* lastSlash = strrchr(exePath, '\\');
@@ -2292,9 +2444,7 @@ static void ScanAndPatchAllLoadedModules() {
             if (hFind != INVALID_HANDLE_VALUE) {
                 do {
                     HMODULE hDevDll = GetModuleHandleA(fd.cFileName);
-                    if (hDevDll) {
-                        PatchModuleIAT(hDevDll, fd.cFileName);
-                    }
+                    if (hDevDll) PatchModuleIAT(hDevDll, fd.cFileName);
                 } while (FindNextFileA(hFind, &fd));
                 FindClose(hFind);
             }
@@ -2302,9 +2452,7 @@ static void ScanAndPatchAllLoadedModules() {
     }
 
     HMODULE hMain = GetModuleHandleA(NULL);
-    if (hMain) {
-        PatchModuleIAT(hMain, "AKSys.exe(Main)");
-    }
+    if (hMain) PatchModuleIAT(hMain, "AKSys.exe(Main)");
 }
 
 static void InstallSetupApiTrampolines() {
@@ -2325,10 +2473,20 @@ static void InstallSetupApiTrampolines() {
             InstallTrampolineHook(pD, (void*)Hook_SetupDiGetDeviceInterfaceDetailA, (void**)&g_realSetupDiGetDeviceInterfaceDetailA);
         }
     }
+
+    HMODULE hOle = GetModuleHandleA("ole32.dll");
+    if (!hOle) hOle = LoadLibraryA("ole32.dll");
+    if (hOle) {
+        void* pDrag = (void*)GetProcAddress(hOle, "DoDragDrop");
+        if (pDrag && !g_realDoDragDrop) {
+            InstallTrampolineHook(pDrag, (void*)Hook_DoDragDrop, (void**)&g_realDoDragDrop);
+        }
+    }
 }
 
 static DWORD WINAPI WatcherThread(LPVOID) {
     EnableDpiAwareness();
+    EnsureWritableWorkingDirectoryAndDragDropFilters();
     RepairAkaiProgramEditorRegistry(false);
     OpenAkaiWinUsbDevices();
     InstallSetupApiTrampolines();
