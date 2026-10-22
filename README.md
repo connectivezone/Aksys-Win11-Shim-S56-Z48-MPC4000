@@ -1,4 +1,4 @@
-# Akai S5000 / S6000 / Z4 / Z8 / MPC4000 — 64-bit Windows WinUSB Proxy Shim & UI Scaler (v15.5)
+# Akai S5000 / S6000 / Z4 / Z8 / MPC4000 — 64-bit Windows WinUSB Proxy Shim & UI Scaler (v3.1.1)
 
 [![Windows Support](https://img.shields.io/badge/Windows-7%20%7C%2010%20%7C%2011%20(64--bit)-0078D6?logo=windows&logoColor=white)](https://github.com/connectivezone/Aksys-shim-with-resizable-ui-no-logging)
 [![ak.Sys Compatibility](https://img.shields.io/badge/ak.Sys-v1.53%20--%20v2.53-brightgreen)](https://github.com/connectivezone/Aksys-shim-with-resizable-ui-no-logging)
