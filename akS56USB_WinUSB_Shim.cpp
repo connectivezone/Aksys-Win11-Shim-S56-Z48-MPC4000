@@ -1520,6 +1520,7 @@ static ScaledSubWindow g_ScaledWins[MAX_SCALED_WINDOWS];
 static HWND g_hToolbarWidget = NULL;
 static double g_CurrentGlobalZoom = 1.5;
 static volatile bool g_KeepAspectRatio = true;
+static volatile bool g_ToolbarClosedByUser = false;
 static ScaledSubWindow* g_LastClickedEditor = NULL;
 
 static ScaledSubWindow* FindByFrame(HWND hwnd) {
@@ -2038,7 +2039,9 @@ static LRESULT CALLBACK CanvasScaleWndProc(HWND hwnd, UINT msg, WPARAM wParam, L
         case WM_SIZE: {
             StripScrollBars(hwnd);
             if (sw->baseCanvasW > 50 && sw->baseCanvasH > 30) {
-                return CallWindowProcA(origProc, hwnd, msg, wParam, MAKELPARAM(sw->baseCanvasW, sw->baseCanvasH));
+                LRESULT sizeRes = CallWindowProcA(origProc, hwnd, msg, wParam, MAKELPARAM(sw->baseCanvasW, sw->baseCanvasH));
+                if (sw->isEb20Window) StripScrollBars(hwnd);
+                return sizeRes;
             }
             break;
         }
@@ -2300,7 +2303,28 @@ static void RegisterAfxFrameWindow(HWND hwnd, double currentZoom, bool forceAppl
         trueBaseH = (clientH > 200) ? clientH : 522;
     } else if (isEb20) {
         trueBaseW = (clientW > 200) ? clientW : 650;
-        trueBaseH = (clientH > 150) ? clientH : 352;
+
+        // The EB20 rack is taller than the window the app first opens it in (the app
+        // relies on a vertical scrollbar), so clientH cuts off the bottom row of knobs.
+        // Read the real content height from the scroll range; fall back to 4 racks x 88px.
+        int ebContentH = 0;
+        HWND ebScrollCands[2] = { hCanvas, hwnd };
+        for (int ebi = 0; ebi < 2 && ebContentH == 0; ebi++) {
+            HWND hs = ebScrollCands[ebi];
+            if (!hs) continue;
+            SCROLLINFO ebSi;
+            memset(&ebSi, 0, sizeof(ebSi));
+            ebSi.cbSize = sizeof(ebSi);
+            ebSi.fMask = SIF_RANGE | SIF_PAGE;
+            if (!GetScrollInfo(hs, SB_VERT, &ebSi)) continue;
+            int ebRange = ebSi.nMax - ebSi.nMin;
+            if (ebRange <= 0) continue;
+            RECT rcView = {0};
+            GetClientRect(hs, &rcView);
+            int ebTotal = (ebSi.nPage > 0) ? (ebRange + 1) : ((rcView.bottom - rcView.top) + ebRange);
+            if (ebTotal >= 150 && ebTotal <= 1200) ebContentH = ebTotal;
+        }
+        trueBaseH = (ebContentH >= 150) ? ebContentH : 352;
     } else {
         trueBaseW = (clientW > 400 && abs(clientW - 766) > 32) ? clientW : 766;
         trueBaseH = (clientH > 546) ? clientH : 546;
@@ -2470,6 +2494,11 @@ static LRESULT CALLBACK ZoomToolbarWndProc(HWND hwnd, UINT msg, WPARAM wParam, L
             EndPaint(hwnd, &ps);
             return 0;
         }
+        case WM_CLOSE: {
+            g_ToolbarClosedByUser = true;
+            DestroyWindow(hwnd);
+            return 0;
+        }
         case WM_DESTROY: {
             PostQuitMessage(0);
             return 0;
@@ -2487,10 +2516,10 @@ static DWORD WINAPI ZoomToolbarUIThread(LPVOID) {
     wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
     RegisterClassA(&wc);
 
-    g_hToolbarWidget = CreateWindowExA(WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
+    g_hToolbarWidget = CreateWindowExA(WS_EX_TOPMOST,
                                        "AkaiZoomBarClassV156",
                                        "ak.sys S5000/S6000/Z4/Z8/MPC4000 Zoom (v15.6)",
-                                       WS_POPUP | WS_CAPTION | WS_VISIBLE | WS_BORDER | WS_SYSMENU,
+                                       WS_POPUP | WS_CAPTION | WS_VISIBLE | WS_BORDER | WS_SYSMENU | WS_MINIMIZEBOX,
                                        140, 90, 410, 106,
                                        NULL, NULL, GetModuleHandleA(NULL), NULL);
     if (!g_hToolbarWidget) return 0;
@@ -2544,6 +2573,7 @@ static DWORD WINAPI ZoomToolbarUIThread(LPVOID) {
 }
 
 static void EnsureZoomToolbarRunning() {
+    if (g_ToolbarClosedByUser) return;
     if (g_hToolbarWidget && IsWindow(g_hToolbarWidget)) return;
     HANDLE hThread = CreateThread(NULL, 0, ZoomToolbarUIThread, NULL, 0, NULL);
     if (hThread) CloseHandle(hThread);
