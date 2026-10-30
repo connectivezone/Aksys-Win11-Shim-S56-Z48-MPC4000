@@ -1,6 +1,6 @@
 // ============================================================================
 // Akai S5000 / S6000 / Z4 / Z8 / MPC4000 Windows 11 64-Bit WinUSB Shim & Scaler
-// Version: v15.7 Production Release (Clean Memory Folder Export - UploadCache Stripped)
+// Version: v3.1.4 Production Release
 // File: akS56USB_WinUSB_Shim.cpp -> Compiles to version.dll (x86)
 // ============================================================================
 
@@ -49,6 +49,54 @@ DEFINE_GUID(GUID_DEVINTERFACE_WINUSB_DEF, 0x88BAE032L, 0x5A81, 0x49F0, 0xBC, 0x3
 static DWORD g_MainProcessId = 0;
 static DWORD g_MainThreadId = 0;
 static HMODULE g_hShimModule = NULL;
+
+// Diagnostic builds only (cl /DAKSHIM_DIAG): window-sizing trace to %TEMP%\aksys_shim_diag.txt.
+#ifdef AKSHIM_DIAG
+static void DiagLog(const char* fmt, ...) {
+    char line[1024];
+    int n = snprintf(line, sizeof(line), "[%lu t%lu] ", GetTickCount(), GetCurrentThreadId());
+    va_list ap;
+    va_start(ap, fmt);
+    _vsnprintf(line + n, sizeof(line) - n - 3, fmt, ap);
+    va_end(ap);
+    line[sizeof(line) - 3] = 0;
+    strcat(line, "\r\n");
+    char path[MAX_PATH];
+    GetTempPathA(MAX_PATH, path);
+    strcat(path, "aksys_shim_diag.txt");
+    HANDLE h = CreateFileA(path, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h != INVALID_HANDLE_VALUE) {
+        DWORD w;
+        WriteFile(h, line, (DWORD)strlen(line), &w, NULL);
+        CloseHandle(h);
+    }
+}
+static const char* DiagCallerName(void* retAddr) {
+    static char name[MAX_PATH];
+    HMODULE hMod = NULL;
+    name[0] = 0;
+    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           (LPCSTR)retAddr, &hMod) && hMod) {
+        char full[MAX_PATH] = {0};
+        GetModuleFileNameA(hMod, full, MAX_PATH - 1);
+        const char* b = strrchr(full, '\\');
+        strncpy(name, b ? b + 1 : full, MAX_PATH - 1);
+    }
+    return name;
+}
+#define DIAG(...) DiagLog(__VA_ARGS__)
+static bool DiagIsSampleFile(const char* p) {
+    if (!p) return false;
+    char l[MAX_PATH] = {0};
+    strncpy(l, p, sizeof(l) - 1);
+    _strlwr(l);
+    return strstr(l, ".wav") || strstr(l, "s56temp");
+}
+#define DIAG_FILE(path, ...) do { if (DiagIsSampleFile(path)) DiagLog(__VA_ARGS__); } while (0)
+#else
+#define DIAG(...) ((void)0)
+#define DIAG_FILE(path, ...) ((void)0)
+#endif
 
 // ----------------------------------------------------------------------------
 // Multi-File Drag-and-Drop & Memory Bank Directory Mirroring Engine
@@ -120,6 +168,84 @@ static void CreateParentDirectoryA(const char* filePath) {
         CreateDirectoryRecursiveA(dir);
     }
 }
+
+// ak.Sys keeps working files ("UploadCache" for samples pulled from the sampler, "S56Temp") in
+// folders next to AKSys.exe. Under Program Files a normal user can't write there, so Windows
+// silently redirects ak.Sys into its VirtualStore, which external editors such as WaveLab can't
+// see: "Edit Sample" opened the wrong file and the saved edit never came back. Every file API
+// the shim hooks therefore rewrites "<AKSys.exe folder>\<working folder>..." to the per-user
+// "%LOCALAPPDATA%\AKAIPRO\aksys\<working folder>...", shared by ak.Sys, the editor and the
+// folder watch, with no permission changes needed.
+static const char* const kAksysWorkFolders[] = { "UploadCache", "S56Temp" };
+
+static bool GetAksysWorkDirs(const char** installDir, const char** userDir) {
+    static char s_install[MAX_PATH] = {0};
+    static char s_user[MAX_PATH] = {0};
+    static volatile LONG s_state = 0;  // 0 = not yet, 1 = ready, 2 = unavailable
+    if (s_state == 0) {
+        char exe[MAX_PATH] = {0};
+        char localAppData[MAX_PATH] = {0};
+        GetModuleFileNameA(NULL, exe, MAX_PATH - 1);
+        char* slash = strrchr(exe, '\\');
+        if (slash) *slash = 0;
+        if (exe[0] && GetEnvironmentVariableA("LOCALAPPDATA", localAppData, MAX_PATH) && localAppData[0]) {
+            strncpy(s_install, exe, MAX_PATH - 1);
+            snprintf(s_user, sizeof(s_user), "%s\\AKAIPRO\\aksys", localAppData);
+            s_state = 1;
+        } else {
+            s_state = 2;
+        }
+    }
+    if (s_state != 1) return false;
+    *installDir = s_install;
+    *userDir = s_user;
+    return true;
+}
+
+// If 'at' points to "<install dir>\<work folder>" (followed by '\', '"' or end), returns the
+// length of the install-dir part to replace; otherwise 0.
+static size_t MatchAksysWorkPath(const char* at, const char* installDir) {
+    size_t dirLen = strlen(installDir);
+    if (_strnicmp(at, installDir, dirLen) != 0 || at[dirLen] != '\\') return 0;
+    const char* rest = at + dirLen + 1;
+    for (int i = 0; i < (int)(sizeof(kAksysWorkFolders) / sizeof(kAksysWorkFolders[0])); i++) {
+        size_t n = strlen(kAksysWorkFolders[i]);
+        if (_strnicmp(rest, kAksysWorkFolders[i], n) == 0 &&
+            (rest[n] == '\\' || rest[n] == '/' || rest[n] == '"' || rest[n] == 0)) {
+            return dirLen;
+        }
+    }
+    return 0;
+}
+
+// Rewrites every ak.Sys working-folder path inside 'in' (a plain path or a command line).
+// Returns true and fills 'out' if anything changed.
+static bool RedirectAksysWorkPaths(const char* in, char* out, size_t outSize) {
+    const char* installDir;
+    const char* userDir;
+    if (!in || !in[0] || !GetAksysWorkDirs(&installDir, &userDir)) return false;
+    size_t userLen = strlen(userDir);
+    size_t o = 0;
+    bool changed = false;
+    for (const char* p = in; *p; ) {
+        size_t m = MatchAksysWorkPath(p, installDir);
+        if (m) {
+            if (o + userLen >= outSize) return false;
+            memcpy(out + o, userDir, userLen);
+            o += userLen;
+            p += m;
+            changed = true;
+        } else {
+            if (o + 1 >= outSize) return false;
+            out[o++] = *p++;
+        }
+    }
+    out[o] = 0;
+    return changed;
+}
+
+// Convenience for hooks: returns the path to use (redirected into 'buf', or the original).
+#define AKSYS_WORK_PATH(path, buf) (RedirectAksysWorkPaths((path), (buf), sizeof(buf)) ? (const char*)(buf) : (path))
 
 static bool StripStagingCachePrefix(char* path) {
     if (!path || !path[0]) return false;
@@ -365,6 +491,8 @@ static HRESULT WINAPI Hook_DoDragDrop(LPDATAOBJECT pDataObj, LPDROPSOURCE pDropS
 
 static BOOL WINAPI Hook_CreateDirectoryA(LPCSTR lpPathName, LPSECURITY_ATTRIBUTES lpSecurityAttributes) {
     if (!lpPathName || !lpPathName[0]) return FALSE;
+    char workBuf[MAX_PATH];
+    lpPathName = AKSYS_WORK_PATH(lpPathName, workBuf);
 
     BOOL ok = CreateDirectoryRecursiveA(lpPathName);
 
@@ -492,6 +620,39 @@ static void RepairAkaiProgramEditorRegistry(bool forceResetLayouts) {
     }
 }
 
+// Shim's own settings live outside HKCU\Software\AKSys\ak.Sys so the layout repair never touches them.
+#define SHIM_SETTINGS_KEY "Software\\AKSysShim"
+
+static DWORD ReadShimSettingDword(const char* name, DWORD defVal) {
+    HKEY hKey = NULL;
+    DWORD val = defVal;
+    if (RegOpenKeyExA(HKEY_CURRENT_USER, SHIM_SETTINGS_KEY, 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
+        DWORD type = 0, data = 0, sz = sizeof(DWORD);
+        if (RegQueryValueExA(hKey, name, NULL, &type, (LPBYTE)&data, &sz) == ERROR_SUCCESS &&
+            type == REG_DWORD && sz == sizeof(DWORD)) {
+            val = data;
+        }
+        RegCloseKey(hKey);
+    }
+    return val;
+}
+
+static void WriteShimSettingDword(const char* name, DWORD val) {
+    HKEY hKey = NULL;
+    if (RegCreateKeyExA(HKEY_CURRENT_USER, SHIM_SETTINGS_KEY, 0, NULL, 0, KEY_WRITE, NULL, &hKey, NULL) == ERROR_SUCCESS) {
+        RegSetValueExA(hKey, name, 0, REG_DWORD, (const BYTE*)&val, sizeof(DWORD));
+        RegCloseKey(hKey);
+    }
+}
+
+// The layout repair forces hidden-panel flags back to 1, which wipes out the user's saved
+// editor layout. Only run it when explicitly requested, and only once.
+static void RepairAkaiProgramEditorRegistryIfRequested() {
+    if (ReadShimSettingDword("RepairEditorLayoutOnNextLaunch", 0) == 0) return;
+    RepairAkaiProgramEditorRegistry(false);
+    WriteShimSettingDword("RepairEditorLayoutOnNextLaunch", 0);
+}
+
 static void EnableDpiAwareness() {
     HMODULE hUser = GetModuleHandleA("user32.dll");
     if (hUser) {
@@ -524,6 +685,7 @@ struct AkaiUsbUnit {
     HANDLE hUsbDevice;
     WINUSB_INTERFACE_HANDLE hWinUsb;
     char winUsbDevicePath[MAX_PATH];
+    char instanceId[MAX_PATH];
     char fakeAkaiPath[MAX_PATH];
     USHORT vid;
     USHORT pid;
@@ -650,14 +812,15 @@ static HANDLE AllocateAkaiHandle(AkaiHandleType type, int unitIndex, const char*
     return INVALID_HANDLE_VALUE;
 }
 
+static void CancelPendingRead(AkaiHandleContext* ctx, WINUSB_INTERFACE_HANDLE hWinUsb, UCHAR inPipe);
+
 static void FreeAkaiHandle(HANDLE h) {
     int idx = GetAkaiHandleIndex(h);
     if (idx < 0) return;
     EnterCriticalSection(&g_UsbLock);
     int uIdx = g_Handles[idx].unitIndex;
-    if (g_Handles[idx].readPending && uIdx >= 0 && uIdx < MAX_AKAI_UNITS && g_Units[uIdx].hWinUsb) {
-        g_Handles[idx].readPending = false;
-        WinUsb_AbortPipe(g_Units[uIdx].hWinUsb, g_Units[uIdx].bulkInPipe);
+    if (uIdx >= 0 && uIdx < MAX_AKAI_UNITS) {
+        CancelPendingRead(&g_Handles[idx], g_Units[uIdx].hWinUsb, g_Units[uIdx].bulkInPipe);
     }
     g_Handles[idx].type = HANDLE_TYPE_UNUSED;
     g_Handles[idx].readPending = false;
@@ -714,6 +877,8 @@ static BOOL WINAPI Hook_CloseHandle(HANDLE hObject) {
 
 static HANDLE WINAPI Hook_CreateFileA(LPCSTR name, DWORD acc, DWORD share, LPSECURITY_ATTRIBUTES sec,
                                      DWORD disp, DWORD flags, HANDLE templ) {
+    char workBuf[MAX_PATH];
+    name = AKSYS_WORK_PATH(name, workBuf);
     if (name) {
         char lower[MAX_PATH] = {0};
         strncpy(lower, name, sizeof(lower) - 1);
@@ -744,6 +909,8 @@ static HANDLE WINAPI Hook_CreateFileA(LPCSTR name, DWORD acc, DWORD share, LPSEC
 
             CreateParentDirectoryA(name);
             HANDLE hReal = CreateFileA(name, acc, share, sec, disp, flags, templ);
+            DIAG_FILE(name, "CreateFileA write '%s' acc=0x%lX disp=%lu -> %s (err %lu)", name, acc, disp,
+                      hReal != INVALID_HANDLE_VALUE ? "ok" : "FAILED", hReal != INVALID_HANDLE_VALUE ? 0 : GetLastError());
             if (hReal != INVALID_HANDLE_VALUE) {
                 RegisterStagedHandle(hReal, name, relPath);
                 return hReal;
@@ -755,6 +922,7 @@ static HANDLE WINAPI Hook_CreateFileA(LPCSTR name, DWORD acc, DWORD share, LPSEC
                 snprintf(redirectedPath, sizeof(redirectedPath), "%sAKSys_Transfer_Cache\\%s", tempPath, relPath);
                 CreateParentDirectoryA(redirectedPath);
                 HANDLE hRedirected = CreateFileA(redirectedPath, acc, share, sec, disp, flags, templ);
+                DIAG_FILE(name, "  -> REDIRECTED to '%s' %s", redirectedPath, hRedirected != INVALID_HANDLE_VALUE ? "ok" : "FAILED");
                 if (hRedirected != INVALID_HANDLE_VALUE) {
                     RegisterStagedHandle(hRedirected, redirectedPath, relPath);
                     return hRedirected;
@@ -762,7 +930,16 @@ static HANDLE WINAPI Hook_CreateFileA(LPCSTR name, DWORD acc, DWORD share, LPSEC
             }
         }
     }
+#ifdef AKSHIM_DIAG
+    {
+        HANDLE h = CreateFileA(name, acc, share, sec, disp, flags, templ);
+        DIAG_FILE(name, "CreateFileA read '%s' acc=0x%lX -> %s (err %lu)", name, acc,
+                  h != INVALID_HANDLE_VALUE ? "ok" : "FAILED", h != INVALID_HANDLE_VALUE ? 0 : GetLastError());
+        return h;
+    }
+#else
     return CreateFileA(name, acc, share, sec, disp, flags, templ);
+#endif
 }
 
 static HANDLE WINAPI Hook_CreateFileW(LPCWSTR name, DWORD acc, DWORD share, LPSECURITY_ATTRIBUTES sec,
@@ -784,7 +961,18 @@ static bool IsUnitAlreadyOpen(const char* devPath) {
     return false;
 }
 
-static bool ConfigureWinUsbUnit(HANDLE hDev, const char* devPath, const char* hwIdLower) {
+// One physical sampler can be reachable through several interface GUID paths
+// (USB device / WinUSB / Akai / Zadig custom); match on the device instance instead.
+static bool IsInstanceAlreadyOpen(const char* instanceId) {
+    for (int i = 0; i < g_UnitCount; i++) {
+        if (g_Units[i].active && _stricmp(g_Units[i].instanceId, instanceId) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool ConfigureWinUsbUnit(HANDLE hDev, const char* devPath, const char* hwIdLower, const char* instanceId) {
     if (g_UnitCount >= MAX_AKAI_UNITS) return false;
 
     WINUSB_INTERFACE_HANDLE hWinUsb = NULL;
@@ -837,6 +1025,7 @@ static bool ConfigureWinUsbUnit(HANDLE hDev, const char* devPath, const char* hw
     u->hUsbDevice = hDev;
     u->hWinUsb = hWinUsb;
     strncpy(u->winUsbDevicePath, devPath, MAX_PATH - 1);
+    if (instanceId) strncpy(u->instanceId, instanceId, MAX_PATH - 1);
     u->bulkInPipe = foundBulkIn;
     u->bulkOutPipe = foundBulkOut;
     u->intInPipe = foundIntIn;
@@ -851,6 +1040,8 @@ static bool ConfigureWinUsbUnit(HANDLE hDev, const char* devPath, const char* hw
         }
         if (u->pid == 0x005E) {
             u->family = FAMILY_S56;
+        } else if (u->pid == 0x006C) {
+            u->family = FAMILY_MPC4000;
         } else {
             u->family = FAMILY_Z48;
         }
@@ -863,14 +1054,14 @@ static bool ConfigureWinUsbUnit(HANDLE hDev, const char* devPath, const char* hw
     return true;
 }
 
-static bool TryDirectPathOpen(const char* candidatePath, const char* hwIdLower) {
+static bool TryDirectPathOpen(const char* candidatePath, const char* hwIdLower, const char* instanceId) {
     if (IsUnitAlreadyOpen(candidatePath)) return true;
 
     HANDLE hDev = CreateFileA(candidatePath, GENERIC_WRITE | GENERIC_READ,
                               FILE_SHARE_WRITE | FILE_SHARE_READ, NULL,
                               OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED, NULL);
     if (hDev != INVALID_HANDLE_VALUE) {
-        if (ConfigureWinUsbUnit(hDev, candidatePath, hwIdLower)) {
+        if (ConfigureWinUsbUnit(hDev, candidatePath, hwIdLower, instanceId)) {
             return true;
         }
         CloseHandle(hDev);
@@ -892,6 +1083,8 @@ static bool ScanAllUsbDevicesUniversal() {
             if (strstr(hwId, "vid_09e8") != NULL) {
                 char instanceId[MAX_PATH] = {0};
                 if (SetupDiGetDeviceInstanceIdA(hDevInfo, &devData, instanceId, sizeof(instanceId) - 1, NULL)) {
+                    if (IsInstanceAlreadyOpen(instanceId)) continue;
+
                     char symInstance[MAX_PATH] = {0};
                     strncpy(symInstance, instanceId, sizeof(symInstance) - 1);
                     for (int c = 0; symInstance[c]; c++) {
@@ -920,7 +1113,7 @@ static bool ScanAllUsbDevicesUniversal() {
                         if (!guidStrings[g] || !guidStrings[g][0]) continue;
                         char candidatePath[MAX_PATH];
                         snprintf(candidatePath, sizeof(candidatePath), "\\\\?\\%s#%s", symInstance, guidStrings[g]);
-                        if (TryDirectPathOpen(candidatePath, hwId)) {
+                        if (TryDirectPathOpen(candidatePath, hwId, instanceId)) {
                             break;
                         }
                     }
@@ -953,7 +1146,50 @@ static BOOL CompleteIoOperation(LPOVERLAPPED lpOverlapped, DWORD bytesTransferre
     return ok;
 }
 
-#define FAKE_HDEVINFO ((HDEVINFO)(ULONG_PTR)0x414B0001)
+// Each fake HDEVINFO carries the device family of the plugin that asked for it, so
+// S56Device.dll only sees S5000/S6000 units and Z48Device.dll only sees Z4/Z8/MPC4000
+// units. Without this every plugin claimed every sampler and ak.Sys listed it twice.
+#define FAKE_HDEVINFO_BASE 0x414B0010
+#define MAKE_FAKE_HDEVINFO(fam) ((HDEVINFO)(ULONG_PTR)(FAKE_HDEVINFO_BASE + (fam)))
+
+static bool IsFakeDevInfo(HDEVINFO s) {
+    ULONG_PTR v = (ULONG_PTR)s;
+    return (v >= FAKE_HDEVINFO_BASE && v <= FAKE_HDEVINFO_BASE + FAMILY_MPC4000);
+}
+
+static AkaiDeviceFamily FakeDevInfoFamily(HDEVINFO s) {
+    return (AkaiDeviceFamily)((ULONG_PTR)s - FAKE_HDEVINFO_BASE);
+}
+
+static AkaiDeviceFamily GetCallerDeviceFamily(void* retAddr) {
+    HMODULE hCaller = NULL;
+    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           (LPCSTR)retAddr, &hCaller) && hCaller) {
+        char modPath[MAX_PATH] = {0};
+        if (GetModuleFileNameA(hCaller, modPath, MAX_PATH - 1)) {
+            _strlwr(modPath);
+            // Only look at the file name: the install folder ("aksys\devices") matches everything.
+            const char* base = strrchr(modPath, '\\');
+            base = base ? base + 1 : modPath;
+            if (strstr(base, "s56")) return FAMILY_S56;
+            if (strstr(base, "z48")) return FAMILY_Z48;
+            if (strstr(base, "mpc")) return FAMILY_MPC4000;
+        }
+    }
+    return FAMILY_ANY;
+}
+
+static bool HasDedicatedMpcPlugin() {
+    return GetModuleHandleA("MPC4000Device.dll") != NULL || GetModuleHandleA("MPC4KDevice.dll") != NULL;
+}
+
+static bool UnitMatchesFamily(const AkaiUsbUnit* u, AkaiDeviceFamily want) {
+    if (want == FAMILY_ANY || u->family == FAMILY_ANY) return true;
+    if (want == FAMILY_Z48) {
+        return u->family == FAMILY_Z48 || (u->family == FAMILY_MPC4000 && !HasDedicatedMpcPlugin());
+    }
+    return u->family == want;
+}
 
 typedef HDEVINFO (WINAPI *PFN_SetupDiGetClassDevsA)(const GUID*, PCSTR, HWND, DWORD);
 typedef BOOL (WINAPI *PFN_SetupDiEnumDeviceInterfaces)(HDEVINFO, PSP_DEVINFO_DATA, const GUID*, DWORD, PSP_DEVICE_INTERFACE_DATA);
@@ -967,7 +1203,11 @@ static bool InstallTrampolineHook(void* targetFunc, void* hookFunc, void** origT
     if (!targetFunc || !hookFunc) return false;
     BYTE* pTarget = (BYTE*)targetFunc;
 
-    if (pTarget[0] != 0x8B || pTarget[1] != 0xFF || pTarget[2] != 0x55 || pTarget[3] != 0x8B || pTarget[4] != 0xEC) {
+    // Accept the hot-patch prologue (mov edi,edi; push ebp; mov ebp,esp) or MSVC6's SEH-frame
+    // prologue (mov eax,imm32). Both are exactly 5 bytes and position-independent.
+    bool hotPatch = (pTarget[0] == 0x8B && pTarget[1] == 0xFF && pTarget[2] == 0x55 && pTarget[3] == 0x8B && pTarget[4] == 0xEC);
+    bool movEaxImm = (pTarget[0] == 0xB8);
+    if (!hotPatch && !movEaxImm) {
         return false;
     }
 
@@ -1015,21 +1255,32 @@ static HDEVINFO WINAPI Hook_SetupDiGetClassDevsA(const GUID* g, PCSTR e, HWND h,
               ((f & DIGCF_DEVICEINTERFACE) && IsAkaiDeviceCaller(_ReturnAddress())))) {
         g_LastQueriedGuid = *g;
         OpenAkaiWinUsbDevices();
-        return FAKE_HDEVINFO;
+        return MAKE_FAKE_HDEVINFO(GetCallerDeviceFamily(_ReturnAddress()));
     }
     if (g_realSetupDiGetClassDevsA) return g_realSetupDiGetClassDevsA(g, e, h, f);
     return SetupDiGetClassDevsA(g, e, h, f);
 }
 
 static BOOL WINAPI Hook_SetupDiEnumDeviceInterfaces(HDEVINFO s, PSP_DEVINFO_DATA d, const GUID* i, DWORD m, PSP_DEVICE_INTERFACE_DATA id) {
-    if (s == FAKE_HDEVINFO) {
+    if (IsFakeDevInfo(s)) {
         OpenAkaiWinUsbDevices();
-        DWORD activeUnits = (g_UnitCount > 0) ? (DWORD)g_UnitCount : 1;
-        if (m < activeUnits) {
+        AkaiDeviceFamily want = FakeDevInfoFamily(s);
+        int unitIdx = -1;
+        if (g_UnitCount == 0) {
+            if (m == 0) unitIdx = 0;
+        } else {
+            DWORD matched = 0;
+            for (int u = 0; u < g_UnitCount; u++) {
+                if (!g_Units[u].active || !UnitMatchesFamily(&g_Units[u], want)) continue;
+                if (matched == m) { unitIdx = u; break; }
+                matched++;
+            }
+        }
+        if (unitIdx >= 0) {
             if (id) {
                 id->InterfaceClassGuid = i ? *i : g_LastQueriedGuid;
                 id->Flags = SPINT_ACTIVE;
-                id->Reserved = (ULONG_PTR)(0x414B0000 + m);
+                id->Reserved = (ULONG_PTR)(0x414B0000 + unitIdx);
             }
             return TRUE;
         }
@@ -1043,7 +1294,7 @@ static BOOL WINAPI Hook_SetupDiEnumDeviceInterfaces(HDEVINFO s, PSP_DEVINFO_DATA
 static BOOL WINAPI Hook_SetupDiGetDeviceInterfaceDetailA(HDEVINFO s, PSP_DEVICE_INTERFACE_DATA id,
                                                         PSP_DEVICE_INTERFACE_DETAIL_DATA_A det,
                                                         DWORD sz, PDWORD req, PSP_DEVINFO_DATA d) {
-    if (s == FAKE_HDEVINFO) {
+    if (IsFakeDevInfo(s)) {
         int unitIdx = 0;
         if (id && (id->Reserved & 0xFFFF0000) == 0x414B0000) {
             unitIdx = (int)(id->Reserved & 0xFFFF);
@@ -1067,12 +1318,75 @@ static BOOL WINAPI Hook_SetupDiGetDeviceInterfaceDetailA(HDEVINFO s, PSP_DEVICE_
 }
 
 static BOOL WINAPI Hook_SetupDiDestroyDeviceInfoList(HDEVINFO s) {
-    if (s == FAKE_HDEVINFO) return TRUE;
+    if (IsFakeDevInfo(s)) return TRUE;
     return SetupDiDestroyDeviceInfoList(s);
+}
+
+// The external sample editor is launched with the working-folder path on its command line
+// (file = editor exe, params = "\"...\\UploadCache\\x.wav\"") or as the document itself.
+static HINSTANCE WINAPI Hook_ShellExecuteA(HWND hwnd, LPCSTR op, LPCSTR file, LPCSTR params, LPCSTR dir, INT show) {
+    char fileBuf[MAX_PATH], paramBuf[1024], dirBuf[MAX_PATH];
+    file = AKSYS_WORK_PATH(file, fileBuf);
+    params = AKSYS_WORK_PATH(params, paramBuf);
+    dir = AKSYS_WORK_PATH(dir, dirBuf);
+    HINSTANCE r = ShellExecuteA(hwnd, op, file, params, dir, show);
+    DIAG("ShellExecuteA op='%s' file='%s' params='%s' dir='%s' -> %d", op ? op : "(null)", file ? file : "(null)",
+         params ? params : "(null)", dir ? dir : "(null)", (int)(INT_PTR)r);
+    return r;
+}
+
+static HANDLE WINAPI Hook_FindFirstChangeNotificationA(LPCSTR path, BOOL subtree, DWORD filter) {
+    char workBuf[MAX_PATH];
+    path = AKSYS_WORK_PATH(path, workBuf);
+    if (path == workBuf) CreateDirectoryRecursiveA(path);  // the watched folder must exist in its new home
+    HANDLE h = FindFirstChangeNotificationA(path, subtree, filter);
+    DIAG("FindFirstChangeNotificationA '%s' subtree=%d filter=0x%lX -> %s (err %lu)", path ? path : "(null)", subtree, filter,
+         h != INVALID_HANDLE_VALUE ? "ok" : "FAILED", h != INVALID_HANDLE_VALUE ? 0 : GetLastError());
+    return h;
+}
+
+static BOOL WINAPI Hook_DeleteFileA(LPCSTR path) {
+    char workBuf[MAX_PATH];
+    path = AKSYS_WORK_PATH(path, workBuf);
+    BOOL ok = DeleteFileA(path);
+    DIAG_FILE(path, "DeleteFileA '%s' -> %d", path, ok);
+    return ok;
+}
+
+static DWORD WINAPI Hook_GetFileAttributesA(LPCSTR path) {
+    char workBuf[MAX_PATH];
+    path = AKSYS_WORK_PATH(path, workBuf);
+    DWORD a = GetFileAttributesA(path);
+    DIAG_FILE(path, "GetFileAttributesA '%s' -> 0x%lX", path, a);
+    return a;
+}
+
+static BOOL WINAPI Hook_GetFileAttributesExA(LPCSTR path, GET_FILEEX_INFO_LEVELS level, LPVOID info) {
+    char workBuf[MAX_PATH];
+    return GetFileAttributesExA(AKSYS_WORK_PATH(path, workBuf), level, info);
+}
+
+static BOOL WINAPI Hook_SetFileAttributesA(LPCSTR path, DWORD attrs) {
+    char workBuf[MAX_PATH];
+    return SetFileAttributesA(AKSYS_WORK_PATH(path, workBuf), attrs);
+}
+
+static BOOL WINAPI Hook_RemoveDirectoryA(LPCSTR path) {
+    char workBuf[MAX_PATH];
+    return RemoveDirectoryA(AKSYS_WORK_PATH(path, workBuf));
+}
+
+static HANDLE WINAPI Hook_FindFirstFileA(LPCSTR pattern, LPWIN32_FIND_DATAA data) {
+    char workBuf[MAX_PATH];
+    return FindFirstFileA(AKSYS_WORK_PATH(pattern, workBuf), data);
 }
 
 static BOOL WINAPI Hook_MoveFileA(LPCSTR lpExisting, LPCSTR lpNew) {
     if (!lpExisting || !lpNew) return FALSE;
+    char existBuf[MAX_PATH], newBuf[MAX_PATH];
+    lpExisting = AKSYS_WORK_PATH(lpExisting, existBuf);
+    lpNew = AKSYS_WORK_PATH(lpNew, newBuf);
+    DIAG_FILE(lpExisting, "MoveFileA '%s' -> '%s'", lpExisting, lpNew);
     CreateParentDirectoryA(lpNew);
     if (MoveFileA(lpExisting, lpNew)) {
         SHChangeNotify(SHCNE_CREATE, SHCNF_PATHA, lpNew, NULL);
@@ -1103,6 +1417,10 @@ static BOOL WINAPI Hook_MoveFileW(LPCWSTR lpExisting, LPCWSTR lpNew) {
 
 static BOOL WINAPI Hook_CopyFileA(LPCSTR lpExisting, LPCSTR lpNew, BOOL bFailIfExists) {
     if (!lpExisting || !lpNew) return FALSE;
+    char existBuf[MAX_PATH], newBuf[MAX_PATH];
+    lpExisting = AKSYS_WORK_PATH(lpExisting, existBuf);
+    lpNew = AKSYS_WORK_PATH(lpNew, newBuf);
+    DIAG_FILE(lpExisting, "CopyFileA '%s' -> '%s'", lpExisting, lpNew);
     CreateParentDirectoryA(lpNew);
     if (CopyFileA(lpExisting, lpNew, bFailIfExists)) {
         SHChangeNotify(SHCNE_CREATE, SHCNF_PATHA, lpNew, NULL);
@@ -1145,9 +1463,9 @@ static void CompletePendingReadForContext(AkaiHandleContext* ctx, DWORD gotBytes
         }
     }
 
-    LPOVERLAPPED uOv = ctx->pUserOv;
+    // Taken atomically so a cancel and a completing read can never both complete it.
+    LPOVERLAPPED uOv = (LPOVERLAPPED)InterlockedExchangePointer((PVOID volatile*)&ctx->pUserOv, NULL);
     ctx->pUserDest = NULL;
-    ctx->pUserOv = NULL;
 
     if (uOv) {
         uOv->Internal = ok ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
@@ -1155,6 +1473,35 @@ static void CompletePendingReadForContext(AkaiHandleContext* ctx, DWORD gotBytes
         if (uOv->hEvent) {
             SetEvent(uOv->hEvent);
         }
+    }
+}
+
+#ifndef STATUS_CANCELLED
+#define STATUS_CANCELLED ((ULONG_PTR)0xC0000120L)
+#endif
+
+// Cancels a pending pipe read the way the real driver does: the transfer is aborted AND the
+// caller's OVERLAPPED is completed as cancelled with its event signalled. Previously only the
+// transfer was aborted, so ak.Sys waited on that event until its own timeout ran out when it
+// cancelled its background read at shutdown (editor windows lingered for several seconds).
+static void CancelPendingRead(AkaiHandleContext* ctx, WINUSB_INTERFACE_HANDLE hWinUsb, UCHAR inPipe) {
+    if (!ctx->readPending) return;
+    ctx->readPending = false;  // stops AsyncReadMonitorThread from completing it as well
+    if (hWinUsb) {
+        WinUsb_AbortPipe(hWinUsb, inPipe);
+        // Let the aborted transfer finish before the read buffer is reused.
+        if (ctx->hEvent) WaitForSingleObject(ctx->hEvent, 200);
+    }
+    if (ctx->hEvent) ResetEvent(ctx->hEvent);
+    ctx->lastBytesTransferred = 0;
+    ctx->lastResultOk = FALSE;
+    ctx->pUserDest = NULL;
+    LPOVERLAPPED uOv = (LPOVERLAPPED)InterlockedExchangePointer((PVOID volatile*)&ctx->pUserOv, NULL);
+    DIAG("USB read cancelled; caller's OVERLAPPED %s", uOv ? "completed as cancelled" : "(none)");
+    if (uOv) {
+        uOv->Internal = STATUS_CANCELLED;
+        uOv->InternalHigh = 0;
+        if (uOv->hEvent) SetEvent(uOv->hEvent);
     }
 }
 
@@ -1407,6 +1754,10 @@ static BOOL WINAPI Hook_GetOverlappedResult(HANDLE hFile, LPOVERLAPPED ov, LPDWO
         DWORD bytes = ov ? (DWORD)ov->InternalHigh : ((idx >= 0) ? g_Handles[idx].lastBytesTransferred : g_LastBytesTransferred);
         BOOL ok = (ov == NULL) ? ((idx >= 0) ? g_Handles[idx].lastResultOk : TRUE) : (ov->Internal == STATUS_SUCCESS);
         if (trans) *trans = bytes;
+        if (ov && ov->Internal == STATUS_CANCELLED) {
+            SetLastError(ERROR_OPERATION_ABORTED);
+            return FALSE;
+        }
         SetLastError(ok ? ERROR_SUCCESS : ERROR_GEN_FAILURE);
         return ok;
     }
@@ -1472,10 +1823,7 @@ static BOOL WINAPI Hook_CancelIo(HANDLE hFile) {
             int uIdx = g_Handles[idx].unitIndex;
             WINUSB_INTERFACE_HANDLE hWinUsb = (uIdx >= 0 && uIdx < MAX_AKAI_UNITS) ? g_Units[uIdx].hWinUsb : NULL;
             UCHAR inPipe = (uIdx >= 0 && uIdx < MAX_AKAI_UNITS && g_Units[uIdx].active) ? g_Units[uIdx].bulkInPipe : 0x82;
-            if (g_Handles[idx].readPending && hWinUsb) {
-                g_Handles[idx].readPending = false;
-                WinUsb_AbortPipe(hWinUsb, inPipe);
-            }
+            CancelPendingRead(&g_Handles[idx], hWinUsb, inPipe);
         }
         return TRUE;
     }
@@ -1493,6 +1841,12 @@ struct ScaledSubWindow {
     bool isRemotePanel;
     bool isZ48OrMpcRemote;
     bool isMultiWindow;
+    bool snapSuppressed;  // WS_MAXIMIZEBOX temporarily removed during an aspect-locked resize
+    bool closing;         // frame is being closed/destroyed: no more re-zooming
+    bool multiCropLocked; // Multi editor's painted area measured consistently; stop re-measuring
+    int multiCropStableCount;
+    int lockedCropW;
+    int lockedCropH;
     bool isProgramWindow;
     bool isEb20Window;
     bool isDropdownPopup;
@@ -1518,10 +1872,18 @@ struct ScaledSubWindow {
 
 static ScaledSubWindow g_ScaledWins[MAX_SCALED_WINDOWS];
 static HWND g_hToolbarWidget = NULL;
-static double g_CurrentGlobalZoom = 1.5;
+static double g_CurrentGlobalZoom = 1.0;
 static volatile bool g_KeepAspectRatio = true;
 static volatile bool g_ToolbarClosedByUser = false;
 static ScaledSubWindow* g_LastClickedEditor = NULL;
+
+// Restore the last zoom preset and aspect lock the user chose (defaults: 1.0x, locked).
+static void LoadZoomSettings() {
+    DWORD pct = ReadShimSettingDword("ZoomPercent", 100);
+    if (pct < 100 || pct > 200) pct = 100;
+    g_CurrentGlobalZoom = pct / 100.0;
+    g_KeepAspectRatio = (ReadShimSettingDword("KeepAspectRatio", 1) != 0);
+}
 
 static ScaledSubWindow* FindByFrame(HWND hwnd) {
     if (!hwnd) return NULL;
@@ -1549,6 +1911,7 @@ static ScaledSubWindow* FindByCanvasOrFrame(HWND hwnd) {
 
 static int GetEffectiveSourceW(ScaledSubWindow* sw) {
     if (!sw) return 100;
+    if (sw->isMultiWindow && sw->cropW >= sw->baseCanvasW / 2 && sw->cropW <= sw->baseCanvasW) return sw->cropW;
     return sw->baseCanvasW;
 }
 
@@ -1600,6 +1963,8 @@ static void EnsureBackbuffer(ScaledSubWindow* sw, HDC hdcRef) {
     sw->cropH = sw->baseCanvasH;
 }
 
+#define MULTI_CROP_LOCK_COUNT 5
+
 static void ProcessBackbufferPixels(ScaledSubWindow* sw) {
     if (!sw || !sw->pBackPixels || sw->backW <= 10 || sw->backH <= 10) return;
     GdiFlush();
@@ -1630,6 +1995,8 @@ static void ProcessBackbufferPixels(ScaledSubWindow* sw) {
         return;
     }
 
+    int prevCropW = sw->cropW;
+    int prevCropH = sw->cropH;
     sw->cropW = W;
     if (sw->isEb20Window) {
         sw->cropH = H;
@@ -1657,7 +2024,47 @@ static void ProcessBackbufferPixels(ScaledSubWindow* sw) {
         else if (validH >= 300 && validH <= 345) validH = 322;
         else if (validH >= 140 && validH <= 175) validH = 154;
         else if (validH <= 125) validH = 104;
+        if (validH != sw->cropH) DIAG("PixelCrop prog: H=%d base=%dx%d cropH %d -> %d", H, sw->baseCanvasW, sw->baseCanvasH, sw->cropH, validH);
         sw->cropH = validH;
+    } else if (sw->isMultiWindow) {
+        // The Multi editor's view is smaller than the window ak.Sys opens it in; the unpainted
+        // strip on the right and bottom is pure black, so scale only the painted area.
+        // That area is fixed, but while ak.Sys builds or tears the editor down the measurement
+        // jumps around, and every jump re-zooms (resizes) a very wide window. So once the same
+        // area has been measured several times running, it is locked in.
+        if (sw->multiCropLocked && sw->lockedCropW <= W && sw->lockedCropH <= H) {
+            sw->cropW = sw->lockedCropW;
+            sw->cropH = sw->lockedCropH;
+            return;
+        }
+        int validW = W;
+        for (int x = W - 1; x >= W / 2; x--) {
+            int nonBlack = 0;
+            for (int y = 0; y < H; y += 4) {
+                if ((px[y * W + x] & 0x00FFFFFF) != 0 && ++nonBlack > 6) break;
+            }
+            if (nonBlack > 6) { validW = x + 1; break; }
+        }
+        int validMultiH = H;
+        for (int y = H - 1; y >= H / 2; y--) {
+            DWORD* row = px + y * W;
+            int nonBlack = 0;
+            for (int x = 0; x < validW; x += 4) {
+                if ((row[x] & 0x00FFFFFF) != 0 && ++nonBlack > 6) break;
+            }
+            if (nonBlack > 6) { validMultiH = y + 1; break; }
+        }
+        if (validW != prevCropW || validMultiH != prevCropH) {
+            DIAG("PixelCrop multi: %dx%d -> %dx%d", W, H, validW, validMultiH);
+            sw->multiCropStableCount = 0;
+        } else if (++sw->multiCropStableCount >= MULTI_CROP_LOCK_COUNT) {
+            sw->multiCropLocked = true;
+            sw->lockedCropW = validW;
+            sw->lockedCropH = validMultiH;
+            DIAG("PixelCrop multi locked at %dx%d", validW, validMultiH);
+        }
+        sw->cropW = validW;
+        sw->cropH = validMultiH;
     } else {
         sw->cropH = H;
     }
@@ -1763,6 +2170,7 @@ static BOOL WINAPI Hook_BitBlt(HDC hdcDest, int xDest, int yDest, int wDest, int
                 }
 
                 int prevCropH = sw->cropH;
+                int prevCropW = sw->cropW;
                 RECT rcClip = {0};
                 int clipType = GetClipBox(hdcDest, &rcClip);
 
@@ -1785,7 +2193,12 @@ static BOOL WINAPI Hook_BitBlt(HDC hdcDest, int xDest, int yDest, int wDest, int
                     }
                     ProcessBackbufferPixels(sw);
 
-                    if (sw->isProgramWindow && abs(sw->cropH - prevCropH) > 30 && !sw->inZoomResize) {
+                    if (sw->isProgramWindow && abs(sw->cropH - prevCropH) > 30 && !sw->inZoomResize && !sw->closing) {
+                        PostMessageA(sw->hwnd, WM_AKAI_APPLY_ZOOM, (WPARAM)(int)(sw->currentZoom * 100.0 + 0.5), 0);
+                    }
+                    if (sw->isMultiWindow && (abs(sw->cropW - prevCropW) > 4 || abs(sw->cropH - prevCropH) > 4) &&
+                        !sw->inZoomResize && !sw->closing) {
+                        DIAG("Multi re-zoom posted: crop %dx%d -> %dx%d", prevCropW, prevCropH, sw->cropW, sw->cropH);
                         PostMessageA(sw->hwnd, WM_AKAI_APPLY_ZOOM, (WPARAM)(int)(sw->currentZoom * 100.0 + 0.5), 0);
                     }
                 }
@@ -1950,8 +2363,351 @@ static LRESULT HandleScaledDrawItem(ScaledSubWindow* sw, HWND hwnd, WNDPROC orig
     return res;
 }
 
+static bool IsScaledEditorFrame(HWND hWnd);
+static bool TakePendingPlacement(HWND hWnd, POINT* pos);
+
 static BOOL WINAPI Hook_SetWindowPos(HWND hWnd, HWND hWndInsertAfter, int X, int Y, int cx, int cy, UINT uFlags) {
+    // Editor being shown for the first time: put it at the position ak.Sys saved for it.
+    POINT savedPos;
+    if ((uFlags & SWP_SHOWWINDOW) && IsScaledEditorFrame(hWnd) && TakePendingPlacement(hWnd, &savedPos)) {
+        DIAG("Restoring saved position (%ld,%ld) on show", savedPos.x, savedPos.y);
+        X = savedPos.x;
+        Y = savedPos.y;
+        uFlags &= ~SWP_NOMOVE;
+    }
+#ifdef AKSHIM_DIAG
+    {
+        HWND hFrame = IsScaledEditorFrame(hWnd) ? hWnd : (IsScaledEditorFrame(GetParent(hWnd)) ? GetParent(hWnd) : NULL);
+        if (hFrame) {
+            char t[128] = {0};
+            GetWindowTextA(hFrame, t, sizeof(t) - 1);
+            DIAG("SetWindowPos %s '%s' from %s x=%d y=%d cx=%d cy=%d flags=0x%X",
+                 hFrame == hWnd ? "frame" : "child", t, DiagCallerName(_ReturnAddress()), X, Y, cx, cy, uFlags);
+        }
+    }
+#endif
     return SetWindowPos(hWnd, hWndInsertAfter, X, Y, cx, cy, uFlags);
+}
+
+static BOOL WINAPI Hook_MoveWindow(HWND hWnd, int X, int Y, int nWidth, int nHeight, BOOL bRepaint) {
+#ifdef AKSHIM_DIAG
+    {
+        HWND hFrame = IsScaledEditorFrame(hWnd) ? hWnd : (IsScaledEditorFrame(GetParent(hWnd)) ? GetParent(hWnd) : NULL);
+        if (hFrame) {
+            char t[128] = {0};
+            GetWindowTextA(hFrame, t, sizeof(t) - 1);
+            DIAG("MoveWindow %s '%s' from %s x=%d y=%d w=%d h=%d",
+                 hFrame == hWnd ? "frame" : "child", t, DiagCallerName(_ReturnAddress()), X, Y, nWidth, nHeight);
+        }
+    }
+#endif
+    return MoveWindow(hWnd, X, Y, nWidth, nHeight, bRepaint);
+}
+
+// With "Save editor positions" on, ak.Sys stores each editor's WINDOWPLACEMENT on close. When a
+// saved placement exists on the next open, ak.Sys takes a different path: it builds the Program
+// Editor off-screen at a fixed 782x143 (top panel only) and then applies the placement, and the
+// editor never gets its other panels. Without a saved placement it builds the full 782x585 editor.
+// So ak.Sys is told no editor placement is saved (Hook_ReadPlacementFromPrefs, an inline hook:
+// the editor frame calls it from inside AKComCtrls.dll, not through an import) and the shim moves
+// the editor to the saved position itself as it is shown (Hook_SetWindowPos). Sizes are saved
+// unzoomed (Hook_GetWindowPlacement) so the stored values stay sane for older builds too.
+#define PLACEMENT_RESTORE_TIMEOUT_MS 60000
+#define MAX_PENDING_PLACEMENTS 16
+
+// ak.Sys can read several editors' placements (e.g. reopening editors at startup) before it
+// shows any of them, so each one waits in its own slot until its window appears.
+struct PendingPlacement {
+    char name[128];
+    bool hasPos;
+    POINT pos;
+    bool hasSize;
+    SIZE size;  // on-screen client size the window had when it was last saved
+    DWORD tick;
+};
+static PendingPlacement g_PendingPlacements[MAX_PENDING_PLACEMENTS];
+static CRITICAL_SECTION g_PendingPlacementLock;
+static volatile LONG g_PendingPlacementLockInit = 0;
+
+static void LockPendingPlacements() {
+    if (InterlockedCompareExchange(&g_PendingPlacementLockInit, 1, 0) == 0) {
+        InitializeCriticalSection(&g_PendingPlacementLock);
+        g_PendingPlacementLockInit = 2;
+    }
+    while (g_PendingPlacementLockInit != 2) Sleep(0);
+    EnterCriticalSection(&g_PendingPlacementLock);
+}
+
+static void AddPendingPlacement(const char* name, const POINT* pos, const SIZE* size) {
+    LockPendingPlacements();
+    DWORD now = GetTickCount();
+    int slot = -1, oldest = 0;
+    for (int i = 0; i < MAX_PENDING_PLACEMENTS; i++) {
+        PendingPlacement* p = &g_PendingPlacements[i];
+        bool live = p->tick && now - p->tick <= PLACEMENT_RESTORE_TIMEOUT_MS;
+        if (live && _stricmp(p->name, name) == 0) { slot = i; break; }
+        if (!live && slot < 0) slot = i;
+        if (p->tick < g_PendingPlacements[oldest].tick) oldest = i;
+    }
+    if (slot < 0) slot = oldest;
+    PendingPlacement* p = &g_PendingPlacements[slot];
+    strncpy(p->name, name, sizeof(p->name) - 1);
+    p->hasPos = (pos != NULL);
+    if (pos) p->pos = *pos;
+    p->hasSize = (size != NULL);
+    if (size) p->size = *size;
+    p->tick = now;
+    LeaveCriticalSection(&g_PendingPlacementLock);
+}
+
+// Per-window position and on-screen size, kept by the shim because ak.Sys saves under the
+// window's current title ("New Multi  1 [AKAI S6000] [active]  WP") but reads back under the
+// plain name ("New Multi  1 WP"), so anything saved while a window was active was never read.
+// Stored as "<section>|<plain name> WP" -> {x, y (workspace coords), client cx, client cy}.
+#define SHIM_WINDOW_STATE_KEY SHIM_SETTINGS_KEY "\\WindowState"
+
+struct SavedWindowState {
+    POINT pos;
+    SIZE size;
+};
+
+// "New Multi  1 [AKAI S6000] [active]  WP" -> "New Multi  1 WP"
+static void NormalizePlacementKey(const char* key, char* out, size_t outSize) {
+    char tmp[128];
+    strncpy(tmp, key, sizeof(tmp) - 1);
+    tmp[sizeof(tmp) - 1] = 0;
+    char* cut = strstr(tmp, " [");
+    if (!cut) cut = strstr(tmp, " WP");
+    if (cut) *cut = 0;
+    size_t n = strlen(tmp);
+    while (n > 0 && tmp[n - 1] == ' ') tmp[--n] = 0;
+    snprintf(out, outSize, "%s WP", tmp);
+}
+
+static bool LoadSavedWindowState(const char* sec, const char* key, SavedWindowState* st) {
+    char plain[128], valName[260];
+    NormalizePlacementKey(key, plain, sizeof(plain));
+    snprintf(valName, sizeof(valName), "%s|%s", sec, plain);
+    HKEY hKey = NULL;
+    bool ok = false;
+    if (RegOpenKeyExA(HKEY_CURRENT_USER, SHIM_WINDOW_STATE_KEY, 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
+        LONG data[4] = {0, 0, 0, 0};
+        DWORD type = 0, sz = sizeof(data);
+        if (RegQueryValueExA(hKey, valName, NULL, &type, (LPBYTE)data, &sz) == ERROR_SUCCESS &&
+            type == REG_BINARY && sz == sizeof(data) && data[2] >= 100 && data[3] >= 40 &&
+            data[2] <= 8000 && data[3] <= 5000) {
+            st->pos.x = data[0];
+            st->pos.y = data[1];
+            st->size.cx = data[2];
+            st->size.cy = data[3];
+            ok = true;
+        }
+        RegCloseKey(hKey);
+    }
+    return ok;
+}
+
+static void StoreWindowState(const char* sec, const char* key, POINT pos, SIZE size) {
+    char plain[128], valName[260];
+    NormalizePlacementKey(key, plain, sizeof(plain));
+    snprintf(valName, sizeof(valName), "%s|%s", sec, plain);
+    HKEY hKey = NULL;
+    if (RegCreateKeyExA(HKEY_CURRENT_USER, SHIM_WINDOW_STATE_KEY, 0, NULL, 0, KEY_WRITE, NULL, &hKey, NULL) == ERROR_SUCCESS) {
+        LONG data[4] = { pos.x, pos.y, size.cx, size.cy };
+        RegSetValueExA(hKey, valName, 0, REG_BINARY, (const BYTE*)data, sizeof(data));
+        RegCloseKey(hKey);
+    }
+}
+
+// ak.Sys saves a window by calling GetWindowPlacement and then WritePlacementToPrefs on the same
+// thread, so the size seen in the first call is stored under the key given to the second.
+static bool g_LastPlacementSizeValid = false;
+static SIZE g_LastPlacementSize = {0, 0};
+
+typedef int (__cdecl *PFN_ReadPlacementFromPrefs)(void* section, void* key, WINDOWPLACEMENT* wp);
+static PFN_ReadPlacementFromPrefs g_realReadPlacementFromPrefs = NULL;
+
+// Both CString arguments are passed by value (one pointer each, to the string data) and are
+// destroyed by the callee, so they are forwarded untouched to the real function.
+static int __cdecl Hook_ReadPlacementFromPrefs(void* section, void* key, WINDOWPLACEMENT* wp) {
+    char sec[128] = {0}, name[128] = {0};
+    __try {
+        if (section) strncpy(sec, (const char*)section, sizeof(sec) - 1);
+        if (key) strncpy(name, (const char*)key, sizeof(name) - 1);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        sec[0] = name[0] = 0;
+    }
+
+    if (!g_realReadPlacementFromPrefs) return 0;
+    int found = g_realReadPlacementFromPrefs(section, key, wp);
+    if (strstr(sec, " WP") && !strstr(name, " WP")) {
+        char tmp[128];
+        strcpy(tmp, sec); strcpy(sec, name); strcpy(name, tmp);
+    }
+    DIAG("ReadPlacementFromPrefs called: '%s' / '%s' found=%d", sec, name, found);
+
+    // The main window and editor list stay entirely on ak.Sys's own path.
+    if (!wp || _stricmp(sec, "aksys") == 0 || !strstr(name, " WP")) return found;
+
+    SavedWindowState st;
+    bool hasState = LoadSavedWindowState(sec, name, &st);
+    if (!found && !hasState) return found;
+
+    // "<title> WP" -> "<title>"; matched as a prefix of the window's title.
+    char title[128];
+    strncpy(title, name, sizeof(title) - 1);
+    title[sizeof(title) - 1] = 0;
+    char* suffix = strstr(title, " WP");
+    if (suffix) *suffix = 0;
+    size_t n = strlen(title);
+    while (n > 0 && title[n - 1] == ' ') title[--n] = 0;
+
+    // The front panel ("<device> WP") builds fine from a saved placement: ak.Sys restores its
+    // position, the shim only restores its size.
+    bool isFrontPanel = _stricmp(title, sec) == 0;
+    if (isFrontPanel) {
+        if (hasState) AddPendingPlacement(title, NULL, &st.size);
+        DIAG("ReadPlacementFromPrefs front panel '%s' size %s", title, hasState ? "pending" : "none");
+        return found;
+    }
+
+    // Prefer the shim's own record: ak.Sys's may be stale (saved under an "[active]" title).
+    // Positions are workspace coordinates (relative to the primary monitor's work area);
+    // SetWindowPos wants screen coordinates. They differ when the taskbar is top/left.
+    POINT pos = hasState ? st.pos : POINT{ wp->rcNormalPosition.left, wp->rcNormalPosition.top };
+    RECT rcWork = {0};
+    if (SystemParametersInfoA(SPI_GETWORKAREA, 0, &rcWork, 0)) {
+        pos.x += rcWork.left;
+        pos.y += rcWork.top;
+    }
+    AddPendingPlacement(title, &pos, hasState ? &st.size : NULL);
+    DIAG("ReadPlacementFromPrefs '%s' / '%s' -> position (%ld,%ld) size %ldx%ld from %s, reported as not saved",
+         sec, title, pos.x, pos.y, hasState ? st.size.cx : 0, hasState ? st.size.cy : 0, hasState ? "shim" : "ak.Sys");
+    return 0;
+}
+
+// Finds the pending entry whose name is the longest prefix of the window's title and takes
+// its position (wantSize=false) or size (wantSize=true).
+static bool TakePendingEntry(HWND hWnd, bool wantSize, POINT* pos, SIZE* size) {
+    char title[128] = {0};
+    GetWindowTextA(hWnd, title, sizeof(title) - 1);
+    if (!title[0]) return false;
+    LockPendingPlacements();
+    // Longest matching name wins, so "New Program 1" never grabs "New Program 10"'s slot.
+    DWORD now = GetTickCount();
+    int best = -1;
+    size_t bestLen = 0;
+    for (int i = 0; i < MAX_PENDING_PLACEMENTS; i++) {
+        PendingPlacement* p = &g_PendingPlacements[i];
+        if (!p->tick || now - p->tick > PLACEMENT_RESTORE_TIMEOUT_MS || !p->name[0]) continue;
+        if (wantSize ? !p->hasSize : !p->hasPos) continue;
+        size_t len = strlen(p->name);
+        if (_strnicmp(title, p->name, len) != 0) continue;
+        char next = title[len];
+        if (next != '\0' && next != ' ') continue;
+        if (len > bestLen) { best = i; bestLen = len; }
+    }
+    if (best >= 0) {
+        PendingPlacement* p = &g_PendingPlacements[best];
+        if (wantSize) { *size = p->size; p->hasSize = false; }
+        else { *pos = p->pos; p->hasPos = false; }
+        if (!p->hasPos && !p->hasSize) p->tick = 0;
+    }
+    LeaveCriticalSection(&g_PendingPlacementLock);
+    return best >= 0;
+}
+
+static bool TakePendingPlacement(HWND hWnd, POINT* pos) { return TakePendingEntry(hWnd, false, pos, NULL); }
+static bool TakePendingSize(HWND hWnd, SIZE* size) { return TakePendingEntry(hWnd, true, NULL, size); }
+static bool IsScaledEditorFrame(HWND hWnd) {
+    if (!hWnd || GetMenu(hWnd) != NULL) return false;  // main frame has the menu bar
+    char clsName[128] = {0};
+    char title[128] = {0};
+    GetClassNameA(hWnd, clsName, sizeof(clsName) - 1);
+    GetWindowTextA(hWnd, title, sizeof(title) - 1);
+    return strstr(clsName, "AfxFrameOrView") != NULL && title[0] != '\0';
+}
+
+static BOOL WINAPI Hook_GetWindowPlacement(HWND hWnd, WINDOWPLACEMENT* lpwndpl) {
+    BOOL ok = GetWindowPlacement(hWnd, lpwndpl);
+    ScaledSubWindow* sw = ok && lpwndpl ? FindByFrame(hWnd) : NULL;
+    g_LastPlacementSizeValid = false;
+    if (sw && sw->initialized && !sw->isDropdownPopup && sw->baseCanvasW > 50 && sw->baseCanvasH > 30) {
+        RECT rcCli = {0};
+        GetClientRect(hWnd, &rcCli);
+        if (rcCli.right >= 100 && rcCli.bottom >= 40 && !IsIconic(hWnd)) {
+            g_LastPlacementSize.cx = rcCli.right;
+            g_LastPlacementSize.cy = rcCli.bottom;
+            g_LastPlacementSizeValid = true;
+        }
+        int nativeH = GetEffectiveSourceH(sw);
+        RECT* rc = &lpwndpl->rcNormalPosition;
+        DIAG("GetWindowPlacement '%s' saved (%ld,%ld)-(%ld,%ld) -> native %dx%d",
+             sw->isProgramWindow ? "prog" : "other", rc->left, rc->top, rc->right, rc->bottom,
+             sw->baseCanvasW + sw->frameNonClientW, nativeH + sw->frameNonClientH);
+        rc->right = rc->left + sw->baseCanvasW + sw->frameNonClientW;
+        rc->bottom = rc->top + nativeH + sw->frameNonClientH;
+    }
+    return ok;
+}
+
+static BOOL WINAPI Hook_SetWindowPlacement(HWND hWnd, const WINDOWPLACEMENT* lpwndpl) {
+#ifdef AKSHIM_DIAG
+    if (lpwndpl) {
+        char t[128] = {0}, c[128] = {0};
+        GetWindowTextA(hWnd, t, sizeof(t) - 1);
+        GetClassNameA(hWnd, c, sizeof(c) - 1);
+        RECT rcCur = {0};
+        GetWindowRect(hWnd, &rcCur);
+        DIAG("SetWindowPlacement '%s' class=%s menu=%d editor=%d show=%u req=(%ld,%ld)-(%ld,%ld) cur=%ldx%ld",
+             t, c, GetMenu(hWnd) != NULL, IsScaledEditorFrame(hWnd), lpwndpl->showCmd,
+             lpwndpl->rcNormalPosition.left, lpwndpl->rcNormalPosition.top,
+             lpwndpl->rcNormalPosition.right, lpwndpl->rcNormalPosition.bottom,
+             rcCur.right - rcCur.left, rcCur.bottom - rcCur.top);
+    }
+#endif
+    if (lpwndpl && IsScaledEditorFrame(hWnd) && !FindByFrame(hWnd)) {
+        // The front panel draws its fixed-size panel into whatever size it is restored at and
+        // leaves the rest black, so it only gets its position here; the shim restores its
+        // on-screen size afterwards.
+        char t[128] = {0};
+        GetWindowTextA(hWnd, t, sizeof(t) - 1);
+        bool isFrontPanel = (_strnicmp(t, "AKAI ", 5) == 0 && !strchr(t, '[')) || _stricmp(t, "MPC4000") == 0;
+        if (isFrontPanel) {
+            RECT rcCur = {0};
+            GetWindowRect(hWnd, &rcCur);
+            WINDOWPLACEMENT wp = *lpwndpl;
+            wp.rcNormalPosition.right = wp.rcNormalPosition.left + (rcCur.right - rcCur.left);
+            wp.rcNormalPosition.bottom = wp.rcNormalPosition.top + (rcCur.bottom - rcCur.top);
+            DIAG("SetWindowPlacement front panel '%s': position only, size kept %ldx%ld", t,
+                 rcCur.right - rcCur.left, rcCur.bottom - rcCur.top);
+            return SetWindowPlacement(hWnd, &wp);
+        }
+
+        // Placements saved by older builds hold the zoomed size; the editor's native width is
+        // the width ak.Sys just created it at, so a wider saved width means a zoomed save.
+        RECT rcCur = {0}, rcCli = {0};
+        GetWindowRect(hWnd, &rcCur);
+        GetClientRect(hWnd, &rcCli);
+        int ncW = (rcCur.right - rcCur.left) - rcCli.right;
+        int ncH = (rcCur.bottom - rcCur.top) - rcCli.bottom;
+        int nativeCliW = rcCli.right;
+        int savedCliW = (lpwndpl->rcNormalPosition.right - lpwndpl->rcNormalPosition.left) - ncW;
+        int savedCliH = (lpwndpl->rcNormalPosition.bottom - lpwndpl->rcNormalPosition.top) - ncH;
+        if (nativeCliW > 50 && savedCliW > nativeCliW + 24 && savedCliH > 0) {
+            double z = (double)savedCliW / (double)nativeCliW;
+            // Zoom presets start at 1.25x; smaller ratios are frame/border differences
+            // (e.g. the borderless front panel), not a zoomed save.
+            if (z >= 1.2 && z <= 4.0) {
+                WINDOWPLACEMENT wp = *lpwndpl;
+                wp.rcNormalPosition.right = wp.rcNormalPosition.left + nativeCliW + ncW;
+                wp.rcNormalPosition.bottom = wp.rcNormalPosition.top + (int)(savedCliH / z + 0.5) + ncH;
+                DIAG("SetWindowPlacement unzoom z=%.2f -> client %dx%d", z, nativeCliW, (int)(savedCliH / z + 0.5));
+                return SetWindowPlacement(hWnd, &wp);
+            }
+        }
+    }
+    return SetWindowPlacement(hWnd, lpwndpl);
 }
 
 static void PerformMainThreadZoom(ScaledSubWindow* sw, double zoom) {
@@ -1965,6 +2721,7 @@ static void PerformMainThreadZoom(ScaledSubWindow* sw, double zoom) {
 
     int targetCanvasW = (int)(srcW * zoom + 0.5);
     int targetCanvasH = (int)(srcH * zoom + 0.5);
+    if (sw->isProgramWindow) DIAG("Zoom prog: z=%.2f src=%dx%d base=%dx%d cropH=%d", zoom, srcW, srcH, sw->baseCanvasW, sw->baseCanvasH, sw->cropH);
 
     int screenW = GetSystemMetrics(SM_CXSCREEN);
     if (sw->isMultiWindow && targetCanvasW > (screenW - 80) && zoom > 1.0) {
@@ -2009,6 +2766,27 @@ static void PerformMainThreadZoom(ScaledSubWindow* sw, double zoom) {
     sw->inZoomResize = false;
 }
 
+// The front panel is clipped to a rounded region and its canvas covers the whole window, so it
+// has no sizing border for Windows to find. Treat its right/bottom edges and bottom-right corner
+// as sizing areas (the corner zone is large enough to reach inside the rounded region).
+#define REMOTE_EDGE_GRIP 10
+#define REMOTE_CORNER_GRIP 48
+
+static LRESULT RemotePanelSizingHitTest(ScaledSubWindow* sw, LPARAM lParam) {
+    if (!sw || !sw->isRemotePanel || !sw->hwnd) return HTNOWHERE;
+    RECT rc = {0};
+    GetWindowRect(sw->hwnd, &rc);
+    int x = (short)LOWORD(lParam);
+    int y = (short)HIWORD(lParam);
+    int fromRight = rc.right - x;
+    int fromBottom = rc.bottom - y;
+    if (fromRight < 0 || fromBottom < 0 || x < rc.left || y < rc.top) return HTNOWHERE;
+    if (fromRight < REMOTE_CORNER_GRIP && fromBottom < REMOTE_CORNER_GRIP) return HTBOTTOMRIGHT;
+    if (fromRight < REMOTE_EDGE_GRIP) return HTRIGHT;
+    if (fromBottom < REMOTE_EDGE_GRIP) return HTBOTTOM;
+    return HTNOWHERE;
+}
+
 static LRESULT CALLBACK CanvasScaleWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     ScaledSubWindow* sw = FindByCanvasOrFrame(hwnd);
     if (!sw || !sw->origCanvasProc) return DefWindowProcA(hwnd, msg, wParam, lParam);
@@ -2017,10 +2795,16 @@ static LRESULT CALLBACK CanvasScaleWndProc(HWND hwnd, UINT msg, WPARAM wParam, L
     switch (msg) {
         case WM_MEASUREITEM: return HandleScaledMeasureItem(sw, hwnd, origProc, wParam, lParam);
         case WM_DRAWITEM:    return HandleScaledDrawItem(sw, hwnd, origProc, wParam, lParam);
+        case WM_NCHITTEST: {
+            // Let the frame handle the front panel's sizing edges.
+            if (RemotePanelSizingHitTest(sw, lParam) != HTNOWHERE) return HTTRANSPARENT;
+            break;
+        }
         case WM_WINDOWPOSCHANGING: {
             WINDOWPOS* wp = (WINDOWPOS*)lParam;
             if (wp && !(wp->flags & SWP_NOSIZE) && !sw->inZoomResize && !sw->isRemotePanel) {
                 if (sw->isProgramWindow && wp->cy > 100 && wp->cy <= 900) {
+                    DIAG("Canvas WPCHANGING prog: req %dx%d cropH %d -> %d", wp->cx, wp->cy, sw->cropH, wp->cy);
                     if (sw->hBackDC && wp->cy < sw->cropH) {
                         RECT rcClear = { 0, wp->cy, sw->baseCanvasW, sw->baseCanvasH };
                         FillRect(sw->hBackDC, &rcClear, (HBRUSH)GetStockObject(BLACK_BRUSH));
@@ -2092,14 +2876,30 @@ static LRESULT CALLBACK FrameScaleWndProc(HWND hwnd, UINT msg, WPARAM wParam, LP
         case WM_DRAWITEM:    return HandleScaledDrawItem(sw, hwnd, origProc, wParam, lParam);
         case WM_AKAI_APPLY_ZOOM: {
             double z = (double)wParam / 100.0;
-            if (z >= 0.5 && z <= 4.0) PerformMainThreadZoom(sw, z);
+            if (z >= 0.5 && z <= 4.0 && !sw->closing) PerformMainThreadZoom(sw, z);
             return 0;
+        }
+        case WM_CLOSE:
+        case WM_DESTROY: {
+            DIAG("Frame %s '%s'", msg == WM_CLOSE ? "WM_CLOSE" : "WM_DESTROY",
+                 sw->isMultiWindow ? "multi" : (sw->isProgramWindow ? "prog" : "other"));
+            // WM_CLOSE can still be cancelled (e.g. a "save changes?" prompt); WM_DESTROY can't.
+            if (msg == WM_DESTROY) sw->closing = true;
+            break;
+        }
+        case WM_NCHITTEST: {
+            LRESULT ht = RemotePanelSizingHitTest(sw, lParam);
+            if (ht != HTNOWHERE) return ht;
+            break;
         }
         case WM_WINDOWPOSCHANGING: {
             WINDOWPOS* wp = (WINDOWPOS*)lParam;
             if (wp && !(wp->flags & SWP_NOSIZE) && !sw->inZoomResize && sw->isProgramWindow) {
                 int reqClientW = wp->cx - sw->frameNonClientW;
                 int reqClientH = wp->cy - sw->frameNonClientH;
+                DIAG("Frame WPCHANGING prog: reqClient %dx%d base=%dx%d cropH=%d match=%d", reqClientW, reqClientH,
+                     sw->baseCanvasW, sw->baseCanvasH, sw->cropH,
+                     (abs(reqClientW - sw->baseCanvasW) <= 24 && reqClientH >= 96 && reqClientH <= 900));
                 if (abs(reqClientW - sw->baseCanvasW) <= 24 && reqClientH >= 96 && reqClientH <= 900) {
                     if (sw->hBackDC && reqClientH < sw->cropH) {
                         RECT rcClear = { 0, reqClientH, sw->baseCanvasW, sw->baseCanvasH };
@@ -2109,6 +2909,20 @@ static LRESULT CALLBACK FrameScaleWndProc(HWND hwnd, UINT msg, WPARAM wParam, LP
                     sw->cropH = reqClientH;
                     wp->cx = (int)(sw->baseCanvasW * sw->currentZoom + 0.5) + sw->frameNonClientW;
                     wp->cy = (int)(sw->cropH * sw->currentZoom + 0.5) + sw->frameNonClientH;
+                }
+            }
+            break;
+        }
+        case WM_NCLBUTTONDOWN: {
+            // With the aspect lock the window edge lags the mouse, so dragging an edge to the
+            // screen edge triggers Windows' "maximise vertically" snap preview. Snap is only offered
+            // to windows with a maximise box, and Windows decides when the resize starts, so drop
+            // the box before the resize loop begins and restore it on WM_EXITSIZEMOVE.
+            if (g_KeepAspectRatio && !sw->snapSuppressed && wParam >= HTLEFT && wParam <= HTBOTTOMRIGHT) {
+                LONG style = GetWindowLongA(hwnd, GWL_STYLE);
+                if (style & WS_MAXIMIZEBOX) {
+                    SetWindowLongA(hwnd, GWL_STYLE, style & ~WS_MAXIMIZEBOX);
+                    sw->snapSuppressed = true;
                 }
             }
             break;
@@ -2145,6 +2959,13 @@ static LRESULT CALLBACK FrameScaleWndProc(HWND hwnd, UINT msg, WPARAM wParam, LP
             }
             break;
         }
+        case WM_EXITSIZEMOVE: {
+            if (sw->snapSuppressed) {
+                SetWindowLongA(hwnd, GWL_STYLE, GetWindowLongA(hwnd, GWL_STYLE) | WS_MAXIMIZEBOX);
+                sw->snapSuppressed = false;
+            }
+            break;
+        }
         case WM_GETMINMAXINFO: {
             LPMINMAXINFO mmi = (LPMINMAXINFO)lParam;
             if (mmi) {
@@ -2154,6 +2975,20 @@ static LRESULT CALLBACK FrameScaleWndProc(HWND hwnd, UINT msg, WPARAM wParam, LP
                 mmi->ptMaxTrackSize.y = 4320;
                 mmi->ptMaxSize.x = 7680;
                 mmi->ptMaxSize.y = 4320;
+                // With the aspect lock, no height beyond what the monitor's width allows at the
+                // window's shape is reachable, so don't let Windows offer one (snap previews).
+                int srcW = GetEffectiveSourceW(sw);
+                int srcH = GetEffectiveSourceH(sw);
+                MONITORINFO mi;
+                mi.cbSize = sizeof(mi);
+                if (g_KeepAspectRatio && srcW > 50 && srcH > 30 &&
+                    GetMonitorInfoA(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mi)) {
+                    int maxClientW = (mi.rcWork.right - mi.rcWork.left) - sw->frameNonClientW;
+                    int maxFrameH = (int)((double)maxClientW * srcH / srcW + 0.5) + sw->frameNonClientH;
+                    if (maxFrameH > mmi->ptMinTrackSize.y && maxFrameH < mmi->ptMaxTrackSize.y) {
+                        mmi->ptMaxTrackSize.y = maxFrameH;
+                    }
+                }
                 return 0;
             }
             break;
@@ -2262,6 +3097,13 @@ static void RegisterAfxFrameWindow(HWND hwnd, double currentZoom, bool forceAppl
     int clientH = rcClient.bottom - rcClient.top;
     if (winW < 100 || winH < 40) return;
 
+    // Fallback for editors shown without SetWindowPos(SWP_SHOWWINDOW): apply the saved position now.
+    POINT savedPos;
+    if (TakePendingPlacement(hwnd, &savedPos)) {
+        DIAG("Restoring saved position (%ld,%ld) on register", savedPos.x, savedPos.y);
+        SetWindowPos(hwnd, NULL, savedPos.x, savedPos.y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+
     char lowerTitle[128] = {0};
     strncpy(lowerTitle, title, sizeof(lowerTitle) - 1);
     _strlwr(lowerTitle);
@@ -2287,8 +3129,9 @@ static void RegisterAfxFrameWindow(HWND hwnd, double currentZoom, bool forceAppl
         hChild = GetWindow(hChild, GW_HWNDNEXT);
     }
 
-    int nonClientW = (winW > clientW) ? (winW - clientW) : 16;
-    int nonClientH = (winH > clientH) ? (winH - clientH) : 39;
+    // Borderless windows (the front panel) really have no non-client area.
+    int nonClientW = (winW >= clientW) ? (winW - clientW) : 16;
+    int nonClientH = (winH >= clientH) ? (winH - clientH) : 39;
 
     int trueBaseW = clientW;
     int trueBaseH = clientH;
@@ -2355,6 +3198,8 @@ static void RegisterAfxFrameWindow(HWND hwnd, double currentZoom, bool forceAppl
     sw->baseCanvasH = trueBaseH;
     sw->cropW = trueBaseW;
     sw->cropH = (isProg && clientH < 500) ? clientH : trueBaseH;
+    DIAG("Register '%s' prog=%d remote=%d multi=%d eb20=%d win=%dx%d client=%dx%d base=%dx%d cropH=%d zoom=%.2f",
+         title, isProg, isRemote, isMulti, isEb20, winW, winH, clientW, clientH, trueBaseW, trueBaseH, sw->cropH, currentZoom);
     sw->curCanvasW = clientW;
     sw->curCanvasH = clientH;
     sw->currentZoom = 1.0;
@@ -2414,6 +3259,20 @@ static void RegisterAfxFrameWindow(HWND hwnd, double currentZoom, bool forceAppl
     DWORD_PTR res = 0;
     SendMessageTimeoutA(hwnd, WM_AKAI_APPLY_ZOOM, (WPARAM)(int)(initialZoom * 100.0 + 0.5), 0,
                         SMTO_ABORTIFHUNG | SMTO_NORMAL, 250, &res);
+
+    // Give the window back the on-screen size it had when it was last closed (the frame's
+    // WM_SIZE handler derives the window's zoom from it).
+    SIZE savedSize;
+    if (TakePendingSize(hwnd, &savedSize)) {
+        RECT rcW = {0}, rcC = {0};
+        GetWindowRect(hwnd, &rcW);
+        GetClientRect(hwnd, &rcC);
+        int ncW = (rcW.right - rcW.left) - rcC.right;
+        int ncH = (rcW.bottom - rcW.top) - rcC.bottom;
+        DIAG("Restoring saved size %ldx%ld for '%s'", savedSize.cx, savedSize.cy, title);
+        SetWindowPos(hwnd, NULL, 0, 0, savedSize.cx + ncW, savedSize.cy + ncH,
+                     SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+    }
 }
 
 static BOOL CALLBACK EnumChildProc(HWND hwndChild, LPARAM lParam) {
@@ -2458,6 +3317,7 @@ static LRESULT CALLBACK ZoomToolbarWndProc(HWND hwnd, UINT msg, WPARAM wParam, L
             if (wmId == ID_CHK_ASPECT) {
                 LRESULT chk = SendMessageA((HWND)lParam, BM_GETCHECK, 0, 0);
                 g_KeepAspectRatio = (chk == BST_CHECKED);
+                WriteShimSettingDword("KeepAspectRatio", g_KeepAspectRatio ? 1 : 0);
                 if (g_KeepAspectRatio) {
                     ScanAndScaleAllSubWindows(g_CurrentGlobalZoom, true);
                 }
@@ -2474,6 +3334,7 @@ static LRESULT CALLBACK ZoomToolbarWndProc(HWND hwnd, UINT msg, WPARAM wParam, L
                 default: return 0;
             }
             g_CurrentGlobalZoom = zoom;
+            WriteShimSettingDword("ZoomPercent", (DWORD)(zoom * 100.0 + 0.5));
             ScanAndScaleAllSubWindows(zoom, true);
             return 0;
         }
@@ -2518,7 +3379,7 @@ static DWORD WINAPI ZoomToolbarUIThread(LPVOID) {
 
     g_hToolbarWidget = CreateWindowExA(WS_EX_TOPMOST,
                                        "AkaiZoomBarClassV156",
-                                       "ak.sys S5000/S6000/Z4/Z8/MPC4000 Zoom (v15.6)",
+                                       "ak.sys S5000/S6000/Z4/Z8/MPC4000 Zoom (v3.1.4)",
                                        WS_POPUP | WS_CAPTION | WS_VISIBLE | WS_BORDER | WS_SYSMENU | WS_MINIMIZEBOX,
                                        140, 90, 410, 106,
                                        NULL, NULL, GetModuleHandleA(NULL), NULL);
@@ -2604,6 +3465,19 @@ static void* ResolveHookFunction(const char* fn) {
     if (strcmp(fn, "ScreenToClient") == 0) return (void*)Hook_ScreenToClient;
     if (strcmp(fn, "ClientToScreen") == 0) return (void*)Hook_ClientToScreen;
     if (strcmp(fn, "SetWindowPos") == 0) return (void*)Hook_SetWindowPos;
+    if (strcmp(fn, "SetWindowPlacement") == 0) return (void*)Hook_SetWindowPlacement;
+    if (strcmp(fn, "GetWindowPlacement") == 0) return (void*)Hook_GetWindowPlacement;
+    if (strcmp(fn, "ShellExecuteA") == 0) return (void*)Hook_ShellExecuteA;
+    if (strcmp(fn, "FindFirstChangeNotificationA") == 0) return (void*)Hook_FindFirstChangeNotificationA;
+    if (strcmp(fn, "DeleteFileA") == 0) return (void*)Hook_DeleteFileA;
+    if (strcmp(fn, "GetFileAttributesA") == 0) return (void*)Hook_GetFileAttributesA;
+    if (strcmp(fn, "GetFileAttributesExA") == 0) return (void*)Hook_GetFileAttributesExA;
+    if (strcmp(fn, "SetFileAttributesA") == 0) return (void*)Hook_SetFileAttributesA;
+    if (strcmp(fn, "RemoveDirectoryA") == 0) return (void*)Hook_RemoveDirectoryA;
+    if (strcmp(fn, "FindFirstFileA") == 0) return (void*)Hook_FindFirstFileA;
+#ifdef AKSHIM_DIAG
+    if (strcmp(fn, "MoveWindow") == 0) return (void*)Hook_MoveWindow;
+#endif
     if (strcmp(fn, "GetClientRect") == 0) return (void*)Hook_GetClientRect;
     if (strcmp(fn, "InvalidateRect") == 0) return (void*)Hook_InvalidateRect;
     return NULL;
@@ -2700,7 +3574,48 @@ static void ScanAndPatchAllLoadedModules() {
     if (hMain) PatchModuleIAT(hMain, "AKSys.exe(Main)");
 }
 
+static PFN_ReadPlacementFromPrefs g_realWritePlacementToPrefs = NULL;  // same signature
+
+static int __cdecl Hook_WritePlacementToPrefs(void* section, void* key, WINDOWPLACEMENT* wp) {
+    char sec[128] = {0}, name[128] = {0};
+    __try {
+        if (section) strncpy(sec, (const char*)section, sizeof(sec) - 1);
+        if (key) strncpy(name, (const char*)key, sizeof(name) - 1);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        sec[0] = name[0] = 0;
+    }
+    if (strstr(sec, " WP") && !strstr(name, " WP")) {
+        char tmp[128];
+        strcpy(tmp, sec); strcpy(sec, name); strcpy(name, tmp);
+    }
+    if (wp) DIAG("WritePlacementToPrefs '%s' / '%s' rect=(%ld,%ld)-(%ld,%ld) size=%s %ldx%ld", sec, name,
+                 wp->rcNormalPosition.left, wp->rcNormalPosition.top, wp->rcNormalPosition.right, wp->rcNormalPosition.bottom,
+                 g_LastPlacementSizeValid ? "stored" : "none", g_LastPlacementSize.cx, g_LastPlacementSize.cy);
+    if (wp && g_LastPlacementSizeValid && sec[0] && strstr(name, " WP")) {
+        POINT pos = { wp->rcNormalPosition.left, wp->rcNormalPosition.top };
+        StoreWindowState(sec, name, pos, g_LastPlacementSize);
+    }
+    g_LastPlacementSizeValid = false;
+    return g_realWritePlacementToPrefs ? g_realWritePlacementToPrefs(section, key, wp) : 0;
+}
+
+static void EnsureReadPlacementHook() {
+    static bool attempted = false;
+    if (attempted) return;
+    HMODULE hCom = GetModuleHandleA("AKComCtrls.dll");
+    if (!hCom) return;
+    attempted = true;
+    void* pRead = (void*)GetProcAddress(hCom, "?ReadPlacementFromPrefs@CComCtrls@@SAHVCString@@0AAUtagWINDOWPLACEMENT@@@Z");
+    bool ok = pRead && InstallTrampolineHook(pRead, (void*)Hook_ReadPlacementFromPrefs, (void**)&g_realReadPlacementFromPrefs);
+    DIAG("ReadPlacementFromPrefs inline hook %s (addr=%p first byte=%02X)", ok ? "installed" : "FAILED",
+         pRead, pRead ? *(BYTE*)pRead : 0);
+    void* pWrite = (void*)GetProcAddress(hCom, "?WritePlacementToPrefs@CComCtrls@@SAHVCString@@0AAUtagWINDOWPLACEMENT@@@Z");
+    bool okW = pWrite && InstallTrampolineHook(pWrite, (void*)Hook_WritePlacementToPrefs, (void**)&g_realWritePlacementToPrefs);
+    DIAG("WritePlacementToPrefs inline hook %s", okW ? "installed" : "FAILED");
+}
+
 static void InstallSetupApiTrampolines() {
+    EnsureReadPlacementHook();
     HMODULE hSetup = GetModuleHandleA("setupapi.dll");
     if (!hSetup) hSetup = LoadLibraryA("setupapi.dll");
     if (hSetup) {
@@ -2732,7 +3647,9 @@ static void InstallSetupApiTrampolines() {
 static DWORD WINAPI WatcherThread(LPVOID) {
     EnableDpiAwareness();
     EnsureWritableWorkingDirectoryAndDragDropFilters();
-    RepairAkaiProgramEditorRegistry(false);
+    RepairAkaiProgramEditorRegistryIfRequested();
+    LoadZoomSettings();
+    DIAG("Shim watcher started, zoom=%.2f aspect=%d", g_CurrentGlobalZoom, (int)g_KeepAspectRatio);
     OpenAkaiWinUsbDevices();
     InstallSetupApiTrampolines();
 
@@ -2745,6 +3662,7 @@ static DWORD WINAPI WatcherThread(LPVOID) {
     while (true) {
         Sleep(250);
         ScanAndPatchAllLoadedModules();
+        EnsureReadPlacementHook();
         EnsureZoomToolbarRunning();
         ScanAndScaleAllSubWindows(g_CurrentGlobalZoom, false);
 

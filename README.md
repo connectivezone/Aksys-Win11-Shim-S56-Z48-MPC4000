@@ -1,15 +1,15 @@
-# Akai S5000 / S6000 / Z4 / Z8 / MPC4000 — 64-bit Windows WinUSB Proxy Shim & UI Scaler (v3.1.1)
+# Akai S5000 / S6000 / Z4 / Z8 / MPC4000 — 64-bit Windows WinUSB Proxy Shim & UI Scaler (v3.1.4)
 
 [![Windows Support](https://img.shields.io/badge/Windows-7%20%7C%2010%20%7C%2011%20(64--bit)-0078D6?logo=windows&logoColor=white)](https://github.com/connectivezone/Aksys-shim-with-resizable-ui-no-logging)
 [![ak.Sys Compatibility](https://img.shields.io/badge/ak.Sys-v1.53%20--%20v2.53-brightgreen)](https://github.com/connectivezone/Aksys-shim-with-resizable-ui-no-logging)
 [![Hardware](https://img.shields.io/badge/Hardware-S5000%20%7C%20S6000%20%7C%20Z4%20%7C%20Z8%20%7C%20MPC4000-crimson)](https://github.com/connectivezone/Aksys-shim-with-resizable-ui-no-logging)
 [![UI Scaler](https://img.shields.io/badge/UI%20Scaler-1.0x--2.0x%20%2B%20Free%20Resize-00b4d8)](https://github.com/connectivezone/Aksys-shim-with-resizable-ui-no-logging)
-[![Build](https://img.shields.io/badge/Build-v15.5%20Release%20%2F%20No--Log-success)](https://github.com/connectivezone/Aksys-shim-with-resizable-ui-no-logging/releases)
+[![Build](https://img.shields.io/badge/Build-v3.1.4%20Release%20%2F%20No--Log-success)](https://github.com/connectivezone/Aksys-shim-with-resizable-ui-no-logging/releases)
 [![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 A lightweight 32-bit user-mode WinUSB proxy shim and UI scaler (`version.dll`) that allows **Akai ak.Sys (v1.53 – v2.53)** to run seamlessly on **64-bit Windows 11, Windows 10, and Windows 7** with the **Akai S5000, S6000, Z4, Z8, and MPC4000**—without custom kernel drivers, without disabling Windows Driver Signature Enforcement, and without test-signing mode.
 
-In addition to restoring plug-and-play USB communication on modern 64-bit Windows, **v15.5** upgrades `ak.Sys` with **real-time resizable editor windows**, **floating zoom controls**, **direct drag & drop file delivery to Windows Explorer folders and Desktop**, and **simultaneous multi-sampler support**.
+In addition to restoring plug-and-play USB communication on modern 64-bit Windows, **v3.1.4** upgrades `ak.Sys` with **real-time resizable editor windows**, **floating zoom controls**, **direct drag & drop file delivery to Windows Explorer folders and Desktop**, and **simultaneous multi-sampler support**.
 
 ---
 
@@ -26,7 +26,7 @@ This project leverages **Microsoft's built-in, digitally signed `WinUSB` (`winus
 ### Key Capabilities
 * **Universal Multi-Machine Support (S5000, S6000, Z4, Z8, MPC4000)**: Automatically enumerates all connected Akai Professional USB devices (`VID_09E8` across all Product IDs and custom Zadig `DeviceInterfaceGUIDs`).
 * **Floating Zoom Control Bar (`1.0x` – `2.0x` + Aspect Ratio Lock)**: Runs on its own dedicated UI message pump thread so it never stalls during heavy USB sample transfers.
-* **Direct Shell Drop Bridge (v15.5 Fix)**: Intercepts the drop target window in Windows Explorer (or Desktop) and directly delivers the downloaded `.WAV`, `.AKP`, and `.AKM` files to the target directory.
+* **Direct Shell Drop Bridge**: Intercepts the drop target window in Windows Explorer (or Desktop) and directly delivers the downloaded `.WAV`, `.AKP`, and `.AKM` files to the target directory.
 * **Remote Panel LCD Viewers (S5000 / S6000 / Z4 / Z8 / MPC4000)**: Handles the complete LCD bitmap stream with multi-chunk bulk packet reassembly, strips out raw `RGB(255, 0, 255)` magenta chroma-key corners, and applies a geometrically scaled rounded bezel region.
 * **Zero Disk I/O Overhead**: All diagnostic file logging is completely stripped out to maximize USB throughput.
 
@@ -135,7 +135,7 @@ C:\Program Files (x86)\AKAIPRO\aksys\
 
 ## 🖱️ Drag-and-Drop Sample Transfers
 
-With **v15.5**, bi-directional drag-and-drop works directly with Windows Explorer:
+With **v3.1.4**, bi-directional drag-and-drop works directly with Windows Explorer:
 
 * **PC &rarr; Sampler**: Drag any `.WAV` sample or `.AKP` program from any folder on your PC directly onto the sampler memory tree or disk tree inside `ak.Sys`.
 * **Sampler &rarr; PC**: Drag any sample or program icon out of `ak.Sys` and release it directly over any open **Windows File Explorer folder** or onto the **Desktop**. The shim intercepts the drop, stages the file, and immediately copies it into your destination directory.
@@ -145,8 +145,8 @@ With **v15.5**, bi-directional drag-and-drop works directly with Windows Explore
 
 ## 🔍 UI Scaling & Floating Toolbar
 
-When `ak.Sys` starts, the shim launches a floating tool window: **`ak.sys Zoom Controls (v15.5)`**:
-* **Preset Buttons**: Click **1.0x**, **1.25x**, **1.5x** (default), **1.75x**, or **2.0x** to rescale all open sub-windows simultaneously.
+When `ak.Sys` starts, the shim launches a floating tool window: **`ak.sys S5000/S6000/Z4/Z8/MPC4000 Zoom (v3.1.4)`**:
+* **Preset Buttons**: Click **1.0x** (default), **1.25x**, **1.5x**, **1.75x**, or **2.0x** to rescale all open sub-windows simultaneously. The last preset you pick (and the aspect-ratio checkbox) is remembered in `HKCU\Software\AKSysShim` and restored at the next launch.
 * **Manual Window Resizing**: Grab any edge or corner of an editor window (Program Editor, Remote LCD Panel, Multi Mixer, EB20 FX) and drag to resize freely.
 * **Lock Original Aspect Ratio**: Keep this box checked to prevent the synthesis racks and LCD screens from stretching disproportionately during manual resizing.
 
@@ -182,6 +182,25 @@ To compile `version.dll` yourself using Visual Studio:
   * Clear the prompt using the sampler's front-panel soft keys, or turn the sampler off and on again before launching `ak.Sys`.
 * **Program Editor opens with only the top knob bar visible**:
   * Click **`Themes ▼`** in the Program Editor header to expand the lower synthesis racks, or run `build_akai_win11_shim.bat` to clear collapsed layout registry flags in `HKCU\Software\AKSys\ak.Sys`.
+  * The shim no longer touches your saved editor layout at startup. To have it force all hidden panels back on once, run the command below, then start `ak.Sys` (the flag resets itself afterwards):
+    ```cmd
+    reg add "HKCU\Software\AKSysShim" /v RepairEditorLayoutOnNextLaunch /t REG_DWORD /d 1 /f
+    ```
+* **Program Editor shows only the top panel with "Save editor positions" turned on** (fixed in v3.1.4):
+  * When an editor has a saved position, ak.Sys builds it on a separate restore path that only creates the top panel. The shim now hides the saved editor position from ak.Sys (so it builds the full editor, as it does when nothing is saved) and moves the editor to its saved position itself. Sizes are saved unzoomed. The main window and editor list restore as normal.
+* **Windows reopening at the wrong position or size** (fixed in v3.1.4):
+  * ak.Sys saves a window under its current title (e.g. `New Multi 1 [AKAI S6000] [active] WP`) but reads it back under the plain name (`New Multi 1 WP`), so a window closed while active lost its position. The shim now keeps its own record of each editor's and front panel's position and on-screen size (scale) in `HKCU\Software\AKSysShim\WindowState` and restores both when the window reopens.
+* **Black border on the Multi editor / front panel** (fixed in v3.1.4):
+  * The Multi editor's unpainted margin is cropped before scaling, and the front panel is always built at its native 540 × 368 before the shim resizes it.
+* **Front panel can't be resized** (fixed in v3.1.4):
+  * Drag the front panel's right edge, bottom edge or bottom-right corner to resize it.
+* **"Edit Sample" opens the wrong file in the external editor, and edits never reach the sampler** (fixed in v3.1.4):
+  * ak.Sys keeps its working files (`UploadCache`, `S56Temp`) next to `AKSys.exe` under Program Files. Normal users can't write there, so Windows silently redirected them into the per-user VirtualStore, which editors such as WaveLab can't see. The shim now moves these folders to `%LOCALAPPDATA%\AKAIPRO\aksys`, so ak.Sys, the editor and ak.Sys's change watcher all use the same real file. No permission changes are needed.
+  * ak.Sys sends the sample back when the editor **saves** the file (e.g. Ctrl+S); closing the editor isn't required.
+* **Editor windows (often the Multi editor) stay on screen for a few seconds when closing ak.Sys** (fixed in v3.1.4):
+  * Cancelling a pending USB read never reported the read as finished, so ak.Sys waited out its own timeout at shutdown. Cancelled reads now complete immediately, as with the original Akai driver. The Multi editor's painted area is also measured once and then fixed, so it is no longer re-scaled while it is being redrawn or closed.
+* **The same sampler appears twice in ak.Sys** (fixed in v3.1.4):
+  * Earlier builds handed every connected sampler to every device plugin, so a Z4/Z8 was claimed by both `S56Device.dll` and `Z48Device.dll`. Each plugin now only sees its own models (S5000/S6000 → `S56Device.dll`; Z4/Z8/MPC4000 → `Z48Device.dll`, or `MPC4000Device.dll` for the MPC4000 when that plugin is installed), and a sampler reachable through more than one interface GUID is only opened once.
 * **Dropped files don't appear after dragging to Explorer**:
   * Make sure you drag to an active Windows Explorer folder window or your Desktop. If Windows UAC permissions block the drop, right-click the item in `ak.Sys` and use **Save As...**.
 
